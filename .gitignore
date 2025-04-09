@@ -1,0 +1,16 @@
+﻿# Ignore everything
+*
+
+# Track Python files
+!*.py
+!*/*.py
+!*/*/*.py
+
+# Track specific files
+!.gitignore
+!README.md
+
+# Ignore Python cache
+__pycache__/
+*.py[cod]
+*.class
