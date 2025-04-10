@@ -808,7 +808,7 @@ def analyze_population_by_flood_depth_and_income(population_data, flooding_data,
     
     # Get NUTS regions at the specified level
     print(f"Selecting all NUTS level {nuts_level} regions in the study area")
-    nuts_level_regions = nuts_gdf[nuts_gdf['LEVL_CODE'] == nuts_level]
+    nuts_level_regions = nuts_gdf[nuts_gdf['LEVL_CODE'] == nuts_level].copy()
     print(f"Found {len(nuts_level_regions)} NUTS level {nuts_level} regions in the dataset")
     
     # Filter regions that intersect with our study area
@@ -863,16 +863,61 @@ def analyze_population_by_flood_depth_and_income(population_data, flooding_data,
 
     from concurrent.futures import ProcessPoolExecutor
 
+    # Add before the parallel processing loop
+    import gc
+    gc.collect()  # Force garbage collection
+    print_memory_usage("Before starting parallel processing")
+
     mp_start = print_timestamp("Starting parallel region processing")
     with ProcessPoolExecutor(max_workers=num_cores) as executor:
-        results = list(executor.map(process_region, region_data))
+        # Add robust exception handling
+        try:
+            print(f"Submitting {len(region_data)} regions to executor with {num_cores} cores")
+            
+            # Process results as they complete, freeing memory along the way
+            result_data = []
+            futures = []
+            
+            # Submit tasks to the executor
+            for i, region in enumerate(region_data):
+                futures.append(executor.submit(process_region_with_income, region))
+            
+            # Process results as they complete
+            from concurrent.futures import as_completed
+            completed = 0
+            for future in as_completed(futures):
+                try:
+                    result = future.result()
+                    if result:
+                        result_data.append(result)
+                    completed += 1
+                    
+                    # Print progress periodically
+                    if completed % 5 == 0 or completed == len(futures):
+                        print(f"Progress: {completed}/{len(futures)} regions completed ({completed/len(futures)*100:.1f}%)")
+                        # Force garbage collection to free memory
+                        gc.collect()
+                        
+                except Exception as e:
+                    print(f"Error in worker process: {str(e)}")
+                    
+            print(f"Executor completed processing {len(result_data)} regions")
+        except Exception as e:
+            print(f"ERROR in parallel processing: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            result_data = []
     print_timestamp("Completed parallel region processing", mp_start)
+
+    # Add after completing parallel processing
+    gc.collect()
+    print_memory_usage("After parallel processing")
 
     total_time = time.time() - start_time
     hours = int(total_time // 3600)
     minutes = int((total_time % 3600) // 60)
     seconds = int(total_time % 60)
-    print(f"Finished processing {len(result_data)}/{total_regions} regions ({100.0:.1f}%) in {hours:02d}:{minutes:02d}:{seconds:02d}")
+    print(f"Finished processing {len(result_data)}/{total_regions} regions ({(len(result_data)/total_regions*100):.1f}%) in {hours:02d}:{minutes:02d}:{seconds:02d}")
     
     # Add debug information before creating the GeoDataFrame
     print(f"Results count: {len(result_data)}")
@@ -883,10 +928,20 @@ def analyze_population_by_flood_depth_and_income(population_data, flooding_data,
     unique_nuts_ids = set(nuts_ids)
     print(f"Unique region IDs in results: {len(unique_nuts_ids)} out of {len(nuts_ids)}")
     
-    # Create result GeoDataFrame with all regions' data
-    # First create a mapping from region ID to geometry to ensure alignment
-    region_id_to_geom = {region.get('NUTS_ID', f'unknown_{idx}'): region.geometry 
-                        for idx, region in study_regions.iterrows()}
+    # Add after counting unique IDs
+    print(f"First few result nuts_ids: {nuts_ids[:5] if nuts_ids else 'No IDs'}")
+    print(f"First few region NUTS_IDs: {[r.get('NUTS_ID', 'None') for _, r in list(study_regions.iterrows())[:5]]}")
+
+    # Create case-insensitive region ID mapping
+    region_id_to_geom = {}
+    for idx, region in study_regions.iterrows():
+        nuts_id = region.get('NUTS_ID', f'unknown_{idx}')
+        if nuts_id:
+            region_id_to_geom[nuts_id] = region.geometry
+            # Also add lowercase version
+            region_id_to_geom[nuts_id.lower()] = region.geometry
+
+    print(f"Created mapping with {len(region_id_to_geom)} regions")
     
     # Extract only results for regions we have geometries for
     valid_results = [result for result in result_data 
@@ -1278,7 +1333,6 @@ def analyze_vulnerable_areas(pop_data, flood_data, income_data, flood_threshold=
 
         start_time = time.time()
         processed_count = 0
-
         
         # Use multiprocessing to analyze vulnerable areas for each region
         slurm_cpus = os.environ.get('SLURM_CPUS_PER_TASK')
@@ -1473,22 +1527,20 @@ def setup_logging(output_dir):
     
     return log_file_path
 
-def process_region(region_data):
+def process_region_with_income(region_data):
     """
-    Process a single region in its own process
-    Returns the result data for that region
+    Process a single region with income analysis in its own process
+    Returns the result data for that region with income stratification
     """
     # Declare global variables to be used in this worker function
-    global pop_data, flood_data, nuts_gdf, depth_ranges
-
-    # At the start of the function
-    print_memory_usage(f"Start processing region {region_data[1].get('NAME_LATN', 'Unknown')}")
-
+    global pop_data, flood_data, income_data_global, nuts_gdf, depth_ranges
+    
+    # At the start of the function - add memory tracking
     idx, region = region_data
     region_name = region.get('NAME_LATN', region.get('NUTS_NAME', 'Unknown'))
+    print_memory_usage(f"Start processing region {region_name}")
     region_start = print_timestamp(f"Starting processing for region: {region_name}")
-
-
+    
     # Buffer output instead of immediate printing
     output_buffer = [f"\nAnalyzing region: {region_name}"]
     
@@ -1508,94 +1560,12 @@ def process_region(region_data):
         
         # Clip the data to the region
         pop_region = pop_data.rio.clip(region_gdf.geometry, region_gdf.crs)
-        print_memory_usage("After region clipping")
-        flood_region = flood_data.rio.clip(region_gdf.geometry, region_gdf.crs)
-        
-        # Calculate total population in region
-        total_pop = float(pop_region.sum().values)
-        output_buffer.append(f"  Total population in region: {total_pop:,.2f}")
-        
-        # Create all masks at once
-        depth_masks = [(flood_region > min_depth) & (flood_region <= max_depth) 
-                      for min_depth, max_depth in depth_ranges]
-        # Apply all masks in one operation
-        affected_pops = [float(pop_region.where(mask, 0).sum().values) for mask in depth_masks]
-        
-        # Calculate population in each flood depth range
-        depth_populations = {}
-        for (min_depth, max_depth), affected_pop in zip(depth_ranges, affected_pops):
-            if max_depth == float('inf'):
-                range_name = f">{min_depth}m"
-            else:
-                range_name = f"{min_depth}-{max_depth}m"
-            
-            depth_populations[range_name] = affected_pop
-            
-            output_buffer.append(f"  Population affected by {range_name} flooding: {affected_pop:,.2f}")
-        
-        # Calculate total affected (any flooding)
-        total_affected = float(pop_region.where(flood_region > 0, 0).sum().values)
-        percentage_affected = (total_affected / total_pop * 100) if total_pop > 0 else 0
-        output_buffer.append(f"  Total affected population: {total_affected:,.2f} ({percentage_affected:.2f}%)")
-        
-        # Store results
-        result_row = {
-            'region_name': region_name,
-            'nuts_id': region.get('NUTS_ID', 'Unknown'),
-            'nuts_level': region.get('LEVL_CODE', 'Unknown'),
-            'total_population': total_pop,
-            'total_affected': total_affected,
-            'percentage_affected': percentage_affected,
-            **depth_populations  # Unpacks all depth category data
-        }
-        
-    except Exception as e:
-        output_buffer.append(f"  Error processing region: {str(e)}")
-        # Import traceback only when needed
-        import traceback
-        output_buffer.append(traceback.format_exc())
-    
-    # Print all buffered output at once (should be more atomic)
-    print("\n".join(output_buffer))
-    
-    # At the end of the function
-    print_memory_usage(f"End processing region {region_name}")
-    print_timestamp(f"Completed processing for region: {region_name}", region_start)
-    return result_row
-
-def process_region_with_income(region_data):
-    """
-    Process a single region with income analysis in its own process
-    Returns the result data for that region with income stratification
-    """
-    # Declare global variables to be used in this worker function
-    global pop_data, flood_data, income_data_global, nuts_gdf, depth_ranges
-    
-    idx, region = region_data
-    print(f"\nAnalyzing region: {region.get('NAME_LATN', region.get('NUTS_NAME', 'Unknown'))}")
-    
-    # Get region geometry
-    region_geom = region.geometry
-    
-    # Initialize result to return in case of error
-    result_row = {
-        'region_name': region.get('NAME_LATN', region.get('NUTS_NAME', 'Unknown')),
-        'nuts_id': region.get('NUTS_ID', 'Unknown'),
-        'nuts_level': region.get('LEVL_CODE', 'Unknown')
-    }
-    
-    try:
-        # Convert region geometry to GeoDataFrame for clipping
-        region_gdf = gpd.GeoDataFrame(geometry=[region_geom], crs=nuts_gdf.crs)
-        
-        # Clip the data to the region
-        pop_region = pop_data.rio.clip(region_gdf.geometry, region_gdf.crs)
         flood_region = flood_data.rio.clip(region_gdf.geometry, region_gdf.crs)
         income_region = income_data_global.rio.clip(region_gdf.geometry, region_gdf.crs)
         
         # Calculate total population in region
         total_pop = float(pop_region.sum().values)
-        print(f"  Total population in region: {total_pop:,.2f}")
+        output_buffer.append(f"  Total population in region: {total_pop:,.2f}")
         
         # Calculate income thresholds for the region
         # We'll use the 33rd and 66th percentiles to divide into thirds
@@ -1603,14 +1573,20 @@ def process_region_with_income(region_data):
         if len(income_values) > 0:
             income_low_threshold = np.percentile(income_values, 33.33)
             income_high_threshold = np.percentile(income_values, 66.67)
-            print(f"  Income thresholds - Low: <{income_low_threshold:.2f}, Medium: {income_low_threshold:.2f}-{income_high_threshold:.2f}, High: >{income_high_threshold:.2f}")
+            output_buffer.append(f"  Income thresholds:")
+            output_buffer.append(f"    Low: <{income_low_threshold:.2f}")
+            output_buffer.append(f"    Medium: {income_low_threshold:.2f}-{income_high_threshold:.2f}")
+            output_buffer.append(f"    High: >{income_high_threshold:.2f}")
             
             # Create income masks
             low_income_mask = income_region <= income_low_threshold
             mid_income_mask = (income_region > income_low_threshold) & (income_region <= income_high_threshold)
             high_income_mask = income_region > income_high_threshold
         else:
-            print("  Warning: No valid income data for this region")
+            output_buffer.append("  Warning: No valid income data for this region")
+            print("\n".join(output_buffer))
+            print_memory_usage(f"End processing region {region_name}")
+            print_timestamp(f"Completed processing for region: {region_name}", region_start)
             return result_row
         
         # Calculate population by income level
@@ -1618,10 +1594,10 @@ def process_region_with_income(region_data):
         pop_mid_income = float(pop_region.where(mid_income_mask, 0).sum().values)
         pop_high_income = float(pop_region.where(high_income_mask, 0).sum().values)
         
-        print(f"  Population by income level:")
-        print(f"    Low income: {pop_low_income:,.2f} ({pop_low_income/total_pop*100:.2f}%)")
-        print(f"    Medium income: {pop_mid_income:,.2f} ({pop_mid_income/total_pop*100:.2f}%)")
-        print(f"    High income: {pop_high_income:,.2f} ({pop_high_income/total_pop*100:.2f}%)")
+        output_buffer.append(f"  Population by income level:")
+        output_buffer.append(f"    Low income: {pop_low_income:,.2f} ({pop_low_income/total_pop*100:.2f}%)")
+        output_buffer.append(f"    Medium income: {pop_mid_income:,.2f} ({pop_mid_income/total_pop*100:.2f}%)")
+        output_buffer.append(f"    High income: {pop_high_income:,.2f} ({pop_high_income/total_pop*100:.2f}%)")
         
         # Initialize depth dictionaries for each income level
         depth_all_income = {}
@@ -1643,7 +1619,7 @@ def process_region_with_income(region_data):
             affected_pop = float(pop_region.where(depth_mask, 0).sum().values)
             depth_all_income[range_name] = affected_pop
             
-            # Calculate for each income level
+            # Calculate for each income level - use efficient mask combination
             affected_low = float(pop_region.where(depth_mask & low_income_mask, 0).sum().values)
             affected_mid = float(pop_region.where(depth_mask & mid_income_mask, 0).sum().values)
             affected_high = float(pop_region.where(depth_mask & high_income_mask, 0).sum().values)
@@ -1653,25 +1629,20 @@ def process_region_with_income(region_data):
             depth_high_income[f"{range_name}_high"] = affected_high
             
             # Fix division by zero errors with safe division
-            if affected_pop > 0:
-                low_pct = affected_low/affected_pop*100
-                mid_pct = affected_mid/affected_pop*100
-                high_pct = affected_high/affected_pop*100
-            else:
-                low_pct = mid_pct = high_pct = 0.0
+            low_pct = (affected_low/affected_pop*100) if affected_pop > 0 else 0.0
+            mid_pct = (affected_mid/affected_pop*100) if affected_pop > 0 else 0.0
+            high_pct = (affected_high/affected_pop*100) if affected_pop > 0 else 0.0
         
-            print(f"  Population affected by {range_name} flooding:")
-            print(f"    Total: {affected_pop:,.2f}")
-            print(f"    Low income: {affected_low:,.2f} ({low_pct:.2f}% of affected)")
-            print(f"    Medium income: {affected_mid:,.2f} ({mid_pct:.2f}% of affected)")
-            print(f"    High income: {affected_high:,.2f} ({high_pct:.2f}% of affected)")
-
-            print(f"PROGRESS: {idx+1}/{len(region_data)} regions processed")
+            output_buffer.append(f"  Population affected by {range_name} flooding:")
+            output_buffer.append(f"    Total: {affected_pop:,.2f}")
+            output_buffer.append(f"    Low income: {affected_low:,.2f} ({low_pct:.2f}% of affected)")
+            output_buffer.append(f"    Medium income: {affected_mid:,.2f} ({mid_pct:.2f}% of affected)")
+            output_buffer.append(f"    High income: {affected_high:,.2f} ({high_pct:.2f}% of affected)")
         
         # Calculate total affected population
         total_affected = float(pop_region.where(flood_region > 0, 0).sum().values)
         percentage_affected = (total_affected / total_pop * 100) if total_pop > 0 else 0
-        print(f"  Total affected population: {total_affected:,.2f} ({percentage_affected:.2f}%)")
+        output_buffer.append(f"  Total affected population: {total_affected:,.2f} ({percentage_affected:.2f}%)")
         
         # Calculate total affected by income level
         total_affected_low = float(pop_region.where((flood_region > 0) & low_income_mask, 0).sum().values)
@@ -1680,7 +1651,7 @@ def process_region_with_income(region_data):
         
         # Store results
         result_row = {
-            'region_name': region.get('NAME_LATN', region.get('NUTS_NAME', 'Unknown')),
+            'region_name': region_name,
             'nuts_id': region.get('NUTS_ID', 'Unknown'),
             'nuts_level': region.get('LEVL_CODE', 'Unknown'),
             'total_population': total_pop,
@@ -1699,8 +1670,21 @@ def process_region_with_income(region_data):
         }
         
     except Exception as e:
-        print(f"  Error processing region: {str(e)}")
-        traceback.print_exc()
+        output_buffer.append(f"  Error processing region: {str(e)}")
+        # Import traceback only when needed
+        import traceback
+        output_buffer.append(traceback.format_exc())
+    
+    # Print all buffered output at once (should be more atomic)
+    print("\n".join(output_buffer))
+    
+    # At the end of the function - add memory tracking
+    print_memory_usage(f"End processing region {region_name}")
+    print_timestamp(f"Completed processing for region: {region_name}", region_start)
+    
+    # Force garbage collection before returning
+    import gc
+    gc.collect()
     
     return result_row
 
