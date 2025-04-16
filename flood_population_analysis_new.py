@@ -730,11 +730,20 @@ def main(scale_factor=None, region_bounds=None, output_dir=None, skip_vis=False,
         print_timestamp("Completed population analysis", analysis_start)
         
         print_memory_usage("After main analysis")
+
+        # Save income-stratified results to GeoJSON for GIS applications
+        if output_dir:
+            print("Saving results to GeoJSON...")
+            geojson_path = os.path.join(output_dir, 'europe_flood_depth_income_analysis.geojson')
+            nuts_pop_by_depth_income.to_file(geojson_path, driver='GeoJSON')
+            print(f"GeoJSON results with income analysis saved to {geojson_path}")
         
         if not skip_vis:
             visualize_population_by_income_and_depth(
                 nuts_pop_by_depth_income, output_dir, flood_filename
             )
+        
+        print_memory_usage("After visualization")
             
         # Run vulnerability hotspot analysis
         analyze_vulnerable_areas(
@@ -746,14 +755,6 @@ def main(scale_factor=None, region_bounds=None, output_dir=None, skip_vis=False,
             nuts_file=nuts_file,
             nuts_level=nuts_level
         )
-        
-        # Save income-stratified results to GeoJSON for GIS applications
-        if output_dir:
-            geojson_path = os.path.join(output_dir, 'europe_flood_depth_income_analysis.geojson')
-            nuts_pop_by_depth_income.to_file(geojson_path, driver='GeoJSON')
-            print(f"GeoJSON results with income analysis saved to {geojson_path}")
-
-        print_memory_usage("After visualization")
         
         print("\n====== ANALYSIS COMPLETE ======")
         print(f"Results saved to {output_dir}")
@@ -772,20 +773,7 @@ def analyze_population_by_flood_depth_and_income(population_data, flooding_data,
                                                region_name=None, nuts_level=None, cpu_cores=None, chunk_size=None):
     """
     Analyze how many people are affected by different flood depth ranges with optional income stratification
-    Uses multiprocessing for parallel region processing
-    
-    Parameters:
-    - population_data: Population raster data
-    - flooding_data: Flood depth raster data
-    - income_data: Optional income raster data (if None, only basic flood analysis is performed)
-    - nuts_file: Path to NUTS regions GeoJSON
-    - region_name: Name of the study region
-    - nuts_level: NUTS level to analyze (0-3)
-    - cpu_cores: Number of CPU cores to use
-    - chunk_size: Size of region chunks for processing
-    
-    Returns:
-    - GeoDataFrame with analysis results
+    Uses threading for parallel region processing (safer than multiprocessing)
     """
     print(f"\n==== ANALYZING POPULATION BY FLOOD DEPTH" + 
           (f" AND INCOME ====" if income_data is not None else " ===="))
@@ -828,7 +816,7 @@ def analyze_population_by_flood_depth_and_income(population_data, flooding_data,
         print(f"Warning: No NUTS level {nuts_level} regions found in study area. Using all available regions.")
         study_regions = nuts_gdf
         print(f"Using {len(study_regions)} regions")
-    
+
     # Make data globally accessible for multi-processing
     global pop_data, flood_data, income_data_global
     pop_data = population_data
@@ -838,14 +826,14 @@ def analyze_population_by_flood_depth_and_income(population_data, flooding_data,
     if income_data is not None:
         income_data_global = income_data
     
-    # Set up multiprocessing pool
+    # Set up threading pool parameters
     slurm_cpus = os.environ.get('SLURM_CPUS_PER_TASK')
     if slurm_cpus:
         num_cores = int(slurm_cpus)
-        print(f"Using {num_cores} CPU cores allocated by SLURM")
+        print(f"Using {num_cores} threads allocated by SLURM")
     else:
         num_cores = min(cpu_cores, multiprocessing.cpu_count()) if cpu_cores else multiprocessing.cpu_count()
-        print(f"Using {num_cores} of {multiprocessing.cpu_count()} available CPU cores")
+        print(f"Using {num_cores} threads of {multiprocessing.cpu_count()} available CPU cores")
     
     # Prepare data for parallel processing
     region_data = [(idx, region) for idx, region in study_regions.iterrows()]
@@ -861,7 +849,7 @@ def analyze_population_by_flood_depth_and_income(population_data, flooding_data,
     start_time = time.time()
     processed_count = 0
 
-    from concurrent.futures import ProcessPoolExecutor
+    from concurrent.futures import ThreadPoolExecutor  # Changed from ProcessPoolExecutor
 
     # Add before the parallel processing loop
     import gc
@@ -869,50 +857,76 @@ def analyze_population_by_flood_depth_and_income(population_data, flooding_data,
     print_memory_usage("Before starting parallel processing")
 
     mp_start = print_timestamp("Starting parallel region processing")
-    with ProcessPoolExecutor(max_workers=num_cores) as executor:
+
+    # Using ThreadPoolExecutor instead of ProcessPoolExecutor
+    with ThreadPoolExecutor(max_workers=num_cores) as executor:
         # Add robust exception handling
         try:
-            print(f"Submitting {len(region_data)} regions to executor with {num_cores} cores")
+            print(f"👉 Starting executor with {num_cores} threads for {len(region_data)} regions")
             
-            # Process results as they complete, freeing memory along the way
+            # Process results as they complete
             result_data = []
             futures = []
             
             # Submit tasks to the executor
+            print("Submitting tasks to executor...")
             for i, region in enumerate(region_data):
-                futures.append(executor.submit(process_region_with_income, region))
+                idx, region_obj = region
+                region_name = region_obj.get('NAME_LATN', region_obj.get('NUTS_NAME', f'Unknown-{idx}'))
+                future = executor.submit(process_region_with_income, region)
+                futures.append((future, region_name))
+                
+                # Print only occasionally to avoid flooding logs
+                if i % 10 == 0 or i == len(region_data) - 1:
+                    print(f"  Submitted {i+1}/{len(region_data)} regions")
             
-            # Process results as they complete
-            from concurrent.futures import as_completed
+            # Process results with better error handling and timeouts
+            from concurrent.futures import as_completed, TimeoutError
             completed = 0
-            for future in as_completed(futures):
+            total = len(futures)
+            
+            print(f"\n👉 Waiting for {total} futures to complete...")
+            
+            # Track which future we're waiting on
+            for i, (future, region_name) in enumerate(futures):
                 try:
-                    result = future.result()
+                    print(f"⏳ Waiting for result from region: {region_name} ({i+1}/{total})")
+                    # Set a timeout per future to prevent hanging on any single one
+                    result = future.result(timeout=600)  # 10-minute timeout per region
+                    
                     if result:
                         result_data.append(result)
+                    
                     completed += 1
-                    
-                    # Print progress periodically
-                    if completed % 5 == 0 or completed == len(futures):
-                        print(f"Progress: {completed}/{len(futures)} regions completed ({completed/len(futures)*100:.1f}%)")
-                        # Force garbage collection to free memory
+                    if completed % 5 == 0 or completed == total:
+                        print(f"✅ Progress: {completed}/{total} regions completed ({completed/total*100:.1f}%)")
+                        # Force garbage collection
                         gc.collect()
-                        
+                        print_memory_usage("After processing batch")
+                except TimeoutError:
+                    print(f"⚠️ Timeout waiting for region {region_name} - skipping")
                 except Exception as e:
-                    print(f"Error in worker process: {str(e)}")
-                    
-            print(f"Executor completed processing {len(result_data)} regions")
+                    print(f"⚠️ Error processing region {region_name}: {str(e)}")
+                    import traceback
+                    traceback.print_exc()
+            
+            print(f"🏁 All regions processed. Completing analysis...")
+            
         except Exception as e:
-            print(f"ERROR in parallel processing: {str(e)}")
-            import traceback
+            print(f"⚠️ ERROR in parallel processing: {str(e)}")
             traceback.print_exc()
             result_data = []
-    print_timestamp("Completed parallel region processing", mp_start)
 
-    # Add after completing parallel processing
+    # This code now runs AFTER the with block completes, which should happen reliably with ThreadPoolExecutor
+    print("\n==== PARALLEL PROCESSING COMPLETED ====")
+    print_timestamp("All parallel region processing finished", mp_start)
+
+    # Memory cleanup
+    print("\n==== FINAL CLEANUP ====")
     gc.collect()
-    print_memory_usage("After parallel processing")
+    print_memory_usage("FINAL STATE")
 
+    # Continue with the rest of the function - create GeoDataFrame from results
     total_time = time.time() - start_time
     hours = int(total_time // 3600)
     minutes = int((total_time % 3600) // 60)
@@ -956,6 +970,50 @@ def analyze_population_by_flood_depth_and_income(population_data, flooding_data,
         geometry=geometries,
         crs=study_regions.crs
     )
+        
+    # -- REGION PROCESSING SUMMARY REPORT --
+    print("\n==== REGION PROCESSING SUMMARY REPORT ====\n")
+    
+    # Collect all region names from original data
+    all_regions = {region.get('NAME_LATN', region.get('NUTS_NAME', f'Unknown-{idx}')): region.get('NUTS_ID', 'Unknown') 
+                  for idx, region in study_regions.iterrows()}
+    
+    # Identify processed regions
+    processed_regions = {result['region_name']: result['nuts_id'] for result in valid_results}
+    
+    # Calculate missing regions (difference between all and processed)
+    processed_region_ids = set(r['nuts_id'] for r in valid_results)
+    missing_regions = {name: nuts_id for name, nuts_id in all_regions.items() 
+                      if nuts_id not in processed_region_ids}
+    
+    # Generate summary statistics
+    print(f"Total regions in study area: {len(all_regions)}")
+    print(f"Successfully processed: {len(processed_regions)} ({len(processed_regions)/len(all_regions)*100:.1f}%)")
+    print(f"Failed or skipped: {len(missing_regions)} ({len(missing_regions)/len(all_regions)*100:.1f}%)")
+    
+    # Print list of regions with issues (if any)
+    if missing_regions:
+        print("\nThe following regions were NOT successfully processed:")
+        for i, (name, nuts_id) in enumerate(missing_regions.items(), 1):
+            print(f"  {i}. {name} (ID: {nuts_id})")
+    
+    # Print detailed region processing report
+    print("\n==== DETAILED REGION PROCESSING REPORT ====\n")
+    print(f"Total regions in study area: {len(all_regions)}")
+    print(f"Successfully processed: {len(processed_regions)} ({len(processed_regions)/len(all_regions)*100:.1f}%)")
+    print(f"Failed or skipped: {len(missing_regions)} ({len(missing_regions)/len(all_regions)*100:.1f}%)\n")
+    
+    if missing_regions:
+        print("The following regions were NOT successfully processed:")
+        for i, (name, nuts_id) in enumerate(missing_regions.items(), 1):
+            print(f"  {i}. {name} (ID: {nuts_id})")
+            
+    print("\nSuccessfully processed regions:")
+    for i, (name, nuts_id) in enumerate(processed_regions.items(), 1):
+        print(f"  {i}. {name} (ID: {nuts_id})")
+    
+    print("\n==== END OF DETAILED REGION PROCESSING REPORT ====")
+    print("\n==== END OF REGION PROCESSING REPORT ====\n")
     
     return result_gdf
 
@@ -969,6 +1027,7 @@ def visualize_population_by_income_and_depth(nuts_pop_by_depth_income, output_di
     - output_dir: Directory to save visualizations
     - flood_filename: Filename of flood data for title extraction
     """
+    import gc
     print("\n==== VISUALIZING POPULATION BY INCOME AND FLOOD DEPTH ====")
     
     if output_dir:
@@ -1189,7 +1248,8 @@ def visualize_data_alignment_with_nuts(pop_data, flood_data, income_data, nuts_f
     """
     print("\n==== VISUALIZING DATA ALIGNMENT FOR VIENNA REGION ONLY ====")
     
-    if output_dir:
+    # Create output directory if specified
+    if output_dir is not None:
         os.makedirs(output_dir, exist_ok=True)
     
     print_memory_usage("Before Vienna alignment check")
@@ -1263,7 +1323,7 @@ def visualize_data_alignment_with_nuts(pop_data, flood_data, income_data, nuts_f
             
         plt.tight_layout()
         
-        if output_dir:
+        if output_dir is not None:
             plt.savefig(os.path.join(output_dir, 'vienna_alignment_check.png'), dpi=300)
             print(f"Vienna alignment check saved to {os.path.join(output_dir, 'vienna_alignment_check.png')}")
             
@@ -1332,46 +1392,67 @@ def analyze_vulnerable_areas(pop_data, flood_data, income_data, flood_threshold=
         total_regions = len(region_data)
 
         start_time = time.time()
-        processed_count = 0
         
-        # Use multiprocessing to analyze vulnerable areas for each region
+        # Use ThreadPoolExecutor instead of Pool
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        
+        # Determine number of cores to use
         slurm_cpus = os.environ.get('SLURM_CPUS_PER_TASK')
         if slurm_cpus:
             num_cores = int(slurm_cpus)
-            print(f"Using {num_cores} CPU cores allocated by SLURM")
-            # Add chunk_size definition here
-            chunk_size = max(1, len(region_data) // (num_cores * 4))
+            print(f"Using {num_cores} threads allocated by SLURM for vulnerability analysis")
         else:
             num_cores = multiprocessing.cpu_count()
-            print(f"Using {num_cores} CPU cores for parallel processing")
-            chunk_size = max(1, len(region_data) // (num_cores * 4))
-
-        print(f"Processing {len(region_data)} regions in chunks of {chunk_size}")
+            print(f"Using {num_cores} threads for vulnerability analysis")
+        
+        print_memory_usage("Before vulnerability analysis")
+        
+        # Process regions using ThreadPoolExecutor
         results = []
-        with Pool(processes=num_cores) as pool:
-            for chunk_idx, chunk in enumerate(chunk_data(region_data, chunk_size)):
-                chunk_results = pool.map(process_vulnerable_region, chunk)
-                results.extend(chunk_results)
-                
-                # Update processed count and calculate progress
-                processed_count += len(chunk)
-                percent_complete = (processed_count / total_regions) * 100
-                
-                # Calculate ETA
-                elapsed_time = time.time() - start_time
-                if processed_count > 0:
-                    time_per_region = elapsed_time / processed_count
-                    regions_remaining = total_regions - processed_count
-                    eta_seconds = time_per_region * regions_remaining
-                    eta_str = f"{int(eta_seconds//3600):02d}:{int((eta_seconds%3600)//60):02d}:{int(eta_seconds%60):02d}"
-                    print(f"Vulnerability analysis progress: {processed_count}/{total_regions} regions ({percent_complete:.1f}%) - ETA: {eta_str}")
+        with ThreadPoolExecutor(max_workers=num_cores) as executor:
+            print(f"👉 Starting vulnerability analysis with {num_cores} threads for {len(region_data)} regions")
+            
+            # Submit all tasks to the executor
+            futures = {executor.submit(process_vulnerable_region, region): i for i, region in enumerate(region_data)}
+            
+            # Track completion and process results
+            completed = 0
+            for future in as_completed(futures):
+                region_idx = futures[future]
+                region_name = region_data[region_idx][1].get('NAME_LATN', 
+                                                            region_data[region_idx][1].get('NUTS_NAME', 
+                                                                                         f'Region-{region_idx}'))
+                try:
+                    result = future.result()
+                    if result:
+                        results.append(result)
+                    
+                    completed += 1
+                    if completed % 5 == 0 or completed == len(futures):
+                        percent_complete = (completed / total_regions) * 100
+                        
+                        # Calculate ETA
+                        elapsed_time = time.time() - start_time
+                        if completed > 0:
+                            time_per_region = elapsed_time / completed
+                            regions_remaining = total_regions - completed
+                            eta_seconds = time_per_region * regions_remaining
+                            eta_str = f"{int(eta_seconds//3600):02d}:{int((eta_seconds%3600)//60):02d}:{int(eta_seconds%60):02d}"
+                            print(f"Vulnerability analysis progress: {completed}/{total_regions} regions ({percent_complete:.1f}%) - ETA: {eta_str}")
+                        
+                        import gc
+                        # Force garbage collection
+                        gc.collect()
+                        print_memory_usage("During vulnerability analysis")
+                        
+                except Exception as e:
+                    print(f"⚠️ Error processing region {region_name} for vulnerability: {str(e)}")
         
         total_time = time.time() - start_time
         hours = int(total_time // 3600)
         minutes = int((total_time % 3600) // 60)
         seconds = int(total_time % 60)
         print(f"Vulnerability analysis completed: {len(results)}/{total_regions} regions in {hours:02d}:{minutes:02d}:{seconds:02d}")
-        
         
         # Combine results
         total_vulnerable_pop = sum(r['vulnerable_population'] for r in results if r is not None)
@@ -1455,7 +1536,6 @@ def analyze_vulnerable_areas(pop_data, flood_data, income_data, flood_threshold=
     print(f"Total vulnerable population: {total_vulnerable_pop:,.2f} (from regions)")
     print(f"Global vulnerable population: {vulnerable_pop:,.2f} (from entire area)")
           
-    
     return vulnerable_pop, total_vulnerable_pop
 
 def setup_logging(output_dir):
@@ -1532,12 +1612,16 @@ def process_region_with_income(region_data):
     Process a single region with income analysis in its own process
     Returns the result data for that region with income stratification
     """
+    import os  # Make sure we have os available for pid
+    
     # Declare global variables to be used in this worker function
     global pop_data, flood_data, income_data_global, nuts_gdf, depth_ranges
     
-    # At the start of the function - add memory tracking
+    # At the start of the function - add process ID for tracking
     idx, region = region_data
     region_name = region.get('NAME_LATN', region.get('NUTS_NAME', 'Unknown'))
+    worker_pid = os.getpid()
+    print(f"WORKER START [PID {worker_pid}]: Processing region {region_name}")
     print_memory_usage(f"Start processing region {region_name}")
     region_start = print_timestamp(f"Starting processing for region: {region_name}")
     
@@ -1678,7 +1762,8 @@ def process_region_with_income(region_data):
     # Print all buffered output at once (should be more atomic)
     print("\n".join(output_buffer))
     
-    # At the end of the function - add memory tracking
+    # At the end of the function - note completion with PID
+    print(f"WORKER COMPLETE [PID {worker_pid}]: Finished region {region_name}")
     print_memory_usage(f"End processing region {region_name}")
     print_timestamp(f"Completed processing for region: {region_name}", region_start)
     
