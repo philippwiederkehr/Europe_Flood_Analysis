@@ -1,33 +1,37 @@
+# Standard library imports
+import argparse
+import multiprocessing
+import os
+import platform
+import re
+import signal
+import sys
+import time
+import traceback
+
+# Third-party imports
+import geopandas as gpd
 import matplotlib
 matplotlib.use('Agg')  # Use non-interactive backend for headless operation
-
-import xarray as xr
-import rioxarray
-import numpy as np
 import matplotlib.pyplot as plt
-import os
-from pathlib import Path
-import rasterio
-from rasterio.windows import from_bounds
-from rasterio.transform import from_bounds as transform_from_bounds
-import geopandas as gpd
-import matplotlib.patheffects as pe
-from shapely.geometry import box
-import seaborn as sns
+import numpy as np
 import pandas as pd
+import rasterio
+from rasterio.enums import Resampling # Added import
+from rasterio.transform import from_bounds as transform_from_bounds
+from rasterio.windows import from_bounds
+import rioxarray
+import seaborn as sns
+from shapely.geometry import box
+import xarray as xr
+
+import matplotlib.patheffects as pe
 import multiprocessing
 from multiprocessing import Pool
 from itertools import islice
-import signal
-import sys
-import re
-import argparse
-import traceback
-import platform
-import time
 import dask.array as da
 
-# Add near the top of your script
+
 def print_memory_usage(label="Current"):
     """Print current memory usage with optional label"""
     import psutil
@@ -300,6 +304,56 @@ def load_flood_data(file_path, bounds=None):
         traceback.print_exc()
         return None
 
+def load_protection_data(file_path, bounds=None):
+    """
+    Load flood protection data using rioxarray.
+    """
+    print(f"\n==== LOADING PROTECTION DATA ====")
+    print(f"Protection file: {file_path}")
+    print(f"Requested bounds: {bounds}")
+    
+    try:
+        protection_data = rioxarray.open_rasterio(file_path, masked=True)
+        print(f"Protection data loaded successfully. Original CRS: {protection_data.rio.crs}")
+        print(f"Protection data original bounds (in original CRS): {protection_data.rio.bounds()}")
+
+        target_crs = "EPSG:4326" # Target CRS for alignment with other datasets and bounds
+
+        # Reproject if CRS is different from target_crs
+        if str(protection_data.rio.crs).upper() != target_crs and protection_data.rio.crs is not None:
+            print(f"Reprojecting protection data from {protection_data.rio.crs} to {target_crs}...")
+            protection_data = protection_data.rio.reproject(target_crs)
+            print(f"Protection data reprojected. New CRS: {protection_data.rio.crs}")
+            print(f"Protection data bounds after reprojection (in {target_crs}): {protection_data.rio.bounds()}")
+        elif protection_data.rio.crs is None:
+            print(f"WARNING: Protection data CRS is None. Assuming it's already {target_crs} or attempting to set it.")
+            # Attempt to set CRS if it's None and we expect EPSG:3035 (ETRS89LAEA)
+            # This is a fallback, ideally the file should have correct CRS info
+            if "ETRS89LAEA" in str(file_path) or "3035" in str(file_path): # Heuristic
+                 print(f"Attempting to set original CRS to EPSG:3035 then reprojecting to {target_crs}")
+                 protection_data = protection_data.rio.write_crs("EPSG:3035", inplace=True)
+                 protection_data = protection_data.rio.reproject(target_crs)
+                 print(f"Protection data reprojected. New CRS: {protection_data.rio.crs}")
+                 print(f"Protection data bounds after reprojection (in {target_crs}): {protection_data.rio.bounds()}")
+            else:
+                print(f"Could not determine original CRS to reproject from. Proceeding without reprojection, assuming {target_crs}.")
+                protection_data = protection_data.rio.write_crs(target_crs, inplace=True)
+
+
+        if bounds:
+            print(f"Attempting to clip protection data (now in {protection_data.rio.crs}) with bounds: {bounds}")
+            # The bounds are expected to be in EPSG:4326
+            protection_data = protection_data.rio.clip_box(*bounds)
+            print(f"Protection data clipped. New bounds: {protection_data.rio.bounds()}")
+            
+        print(f"Protection data loaded with shape: {protection_data.shape}")
+        return protection_data
+            
+    except Exception as e:
+        print(f"Error loading protection data: {str(e)}")
+        traceback.print_exc()
+        return None
+
 def load_income_data(file_path, bounds=None):
     print(f"\n==== LOADING INCOME DATA ====")
     print(f"Income file: {file_path}")
@@ -326,7 +380,7 @@ def load_income_data(file_path, bounds=None):
         traceback.print_exc()
         return None
 
-def align_datasets(pop_data, flood_data, income_data):
+def align_datasets(pop_data, flood_data, income_data, protection_data):
     """
     Reproject and align all datasets to the same grid and CRS, using the finest resolution dataset as reference
     """
@@ -334,26 +388,31 @@ def align_datasets(pop_data, flood_data, income_data):
     print(f"Population data: {pop_data.shape} with CRS {pop_data.rio.crs}")
     print(f"Flood data: {flood_data.shape} with CRS {flood_data.rio.crs}")
     print(f"Income data: {income_data.shape} with CRS {income_data.rio.crs}")
+    print(f"Protection data: {protection_data.shape} with CRS {protection_data.rio.crs}")
     
     # Get resolutions of each dataset
     pop_res = pop_data.rio.resolution()
     flood_res = flood_data.rio.resolution()
     income_res = income_data.rio.resolution()
+    protection_res = protection_data.rio.resolution()
     
     print(f"Population data resolution: {pop_res}")
     print(f"Flood data resolution: {flood_res}")
     print(f"Income data resolution: {income_res}")
+    print(f"Protection data resolution: {protection_res}")
     
     # Calculate resolution as the average of x and y resolution
     pop_avg_res = (abs(pop_res[0]) + abs(pop_res[1])) / 2
     flood_avg_res = (abs(flood_res[0]) + abs(flood_res[1])) / 2
     income_avg_res = (abs(income_res[0]) + abs(income_res[1])) / 2
+    protection_avg_res = (abs(protection_res[0]) + abs(protection_res[1])) / 2
     
     # Determine which dataset has the finest resolution (smallest value)
     resolutions = {
         'population': pop_avg_res,
         'flood': flood_avg_res,
-        'income': income_avg_res
+        'income': income_avg_res,
+        'protection': protection_avg_res
     }
     
     finest_dataset = min(resolutions, key=resolutions.get)
@@ -364,7 +423,9 @@ def align_datasets(pop_data, flood_data, income_data):
         reference_data = pop_data
     elif finest_dataset == 'flood':
         reference_data = flood_data
-    else:
+    elif finest_dataset == 'protection':
+        reference_data = protection_data
+    else: # income
         reference_data = income_data
     
     print(f"Using {finest_dataset} data as reference for all reprojections")
@@ -375,56 +436,55 @@ def align_datasets(pop_data, flood_data, income_data):
         reprojected_datasets = []
         
         if finest_dataset != 'population':
+            # ... existing population reprojection code ...
             print(f"Reprojecting population data to match {finest_dataset} resolution...")
             
-            # Calculate the scale factor based on resolution change
-            pop_res = pop_data.rio.resolution()
-            ref_res = reference_data.rio.resolution()
-            area_ratio = (abs(ref_res[0]) * abs(ref_res[1])) / (abs(pop_res[0]) * abs(pop_res[1]))
-            
-            # Get population sum before reprojection
             pop_sum_before = float(pop_data.sum().values)
+            pop_data = pop_data.rio.reproject_match(reference_data, resampling=rasterio.enums.Resampling.bilinear)
+            pop_sum_after = float(pop_data.sum().values)
 
-            # Reproject with bilinear interpolation
-            pop_data = pop_data.rio.reproject_match(reference_data)
-            
-            # Apply the area ratio correction to maintain density
-            pop_data = pop_data * area_ratio
+            # Attempt to conserve population counts if reprojection changes them significantly due to resolution differences
+            if pop_sum_before > 0 and pop_sum_after > 0:
+                scaling_factor = pop_sum_before / pop_sum_after
+                if abs(scaling_factor - 1.0) > 0.01: # Only adjust if difference is more than 1%
+                    print(f"Scaling reprojected population data by factor: {scaling_factor:.4f}")
+                    pop_data = pop_data * scaling_factor
             
             print(f"Population data shape after reprojection: {pop_data.shape}")
-            print(f"Population sum before: {pop_sum_before}")
-            print(f"Population sum after: {float(pop_data.sum().values)}")
+            print(f"Population sum before: {pop_sum_before}, after: {float(pop_data.sum().values)}")
             reprojected_datasets.append('population')
-        
+
         if finest_dataset != 'flood':
             print(f"Reprojecting flood data to match {finest_dataset} resolution...")
-            flood_data_before = flood_data.copy()
-            flood_data = flood_data.rio.reproject_match(reference_data)
+            flood_data = flood_data.rio.reproject_match(reference_data, resampling=rasterio.enums.Resampling.bilinear)
             print(f"Flood data shape after reprojection: {flood_data.shape}")
-            print(f"Cells affected by flooding before: {(flood_data_before > 0).sum().values.item()}")
-            print(f"Cells affected by flooding after: {(flood_data > 0).sum().values.item()}")
             reprojected_datasets.append('flood')
-        
+
         if finest_dataset != 'income':
             print(f"Reprojecting income data to match {finest_dataset} resolution...")
-            income_data_before = income_data.copy()
-            income_data = income_data.rio.reproject_match(reference_data)
+            income_data = income_data.rio.reproject_match(reference_data, resampling=rasterio.enums.Resampling.bilinear)
             print(f"Income data shape after reprojection: {income_data.shape}")
             reprojected_datasets.append('income')
+
+        if finest_dataset != 'protection':
+            print(f"Reprojecting protection data to match {finest_dataset} resolution...")
+            # Use nearest neighbor for protection data as it represents classes (RP years)
+            protection_data = protection_data.rio.reproject_match(reference_data, resampling=rasterio.enums.Resampling.nearest)
+            print(f"Protection data shape after reprojection: {protection_data.shape}")
+            reprojected_datasets.append('protection')
         
         if reprojected_datasets:
             print(f"Successfully reprojected datasets: {', '.join(reprojected_datasets)}")
         else:
             print(f"No reprojection needed, all datasets already match the finest resolution")
         
-        return pop_data, flood_data, income_data
+        return pop_data, flood_data, income_data, protection_data
             
     except Exception as e:
         print(f"Error aligning datasets: {str(e)}")
-        import traceback
         traceback.print_exc()
         
-        return pop_data, flood_data, income_data
+        return pop_data, flood_data, income_data, protection_data
 
 def calculate_affected_population(pop_data, flood_data, flood_threshold=0.0):
     """
@@ -658,6 +718,9 @@ def main(scale_factor=None, region_bounds=None, output_dir=None, skip_vis=False,
     # Income file 
     income_file = os.path.join(script_dir, 'Europe_disp_inc_2015.tif')
     
+    # Protection file
+    protection_file = os.path.join(script_dir, 'floodProtection_v2019_paper', 'floodProtection_v2019_paper3.tif')
+    
     # NUTS regions file
     nuts_file = os.path.join(script_dir, 'NUTS_RG_01M_2024_4326.geojson')
     
@@ -674,6 +737,7 @@ def main(scale_factor=None, region_bounds=None, output_dir=None, skip_vis=False,
     print(f"Using population data: {population_file}")
     print(f"Using flood data: {flood_file}")
     print(f"Using income data: {income_file}")
+    print(f"Using protection data: {protection_file}")
     print(f"Using NUTS regions: {nuts_file}")
     print(f"Output will be saved to: {output_dir}")
     
@@ -698,15 +762,35 @@ def main(scale_factor=None, region_bounds=None, output_dir=None, skip_vis=False,
     income_data = load_income_data(income_file, bounds=region_bounds)
     print_timestamp("Loaded income data", loading_start)
     
+    protection_data = load_protection_data(protection_file, bounds=region_bounds)
+    print_timestamp("Loaded protection data", loading_start)
+
     print_memory_usage("After loading all datasets")
     
-    if pop_data is not None and flood_data is not None and income_data is not None:
-        # Align all datasets - income is now required
-        align_start = print_timestamp("Starting dataset alignment")  # Add this line to define align_start
-        pop_data, flood_data, income_data = align_datasets(pop_data, flood_data, income_data)
+    if pop_data is not None and flood_data is not None and income_data is not None and protection_data is not None:
+        # Align all datasets
+        align_start = print_timestamp("Starting dataset alignment")
+        pop_data, flood_data, income_data, protection_data = align_datasets(pop_data, flood_data, income_data, protection_data)
         print_memory_usage("After dataset alignment")
         print_timestamp("Completed dataset alignment", align_start)
-        print("All datasets successfully loaded and aligned")
+        
+        # Apply flood protection filter
+        filter_start = print_timestamp("Starting flood protection filter")
+        flood_data_protected = apply_protection_filter(flood_data, protection_data, flood_filename)
+        print_memory_usage("After applying protection filter")
+        print_timestamp("Completed flood protection filter", filter_start)
+
+        # Save the protected flood data
+        if output_dir:
+            protected_flood_output_path = os.path.join(output_dir, f"{os.path.splitext(flood_filename)[0]}_protected.tif")
+            try:
+                flood_data_protected.rio.to_raster(protected_flood_output_path, compress='LZW', dtype='float32')
+                print(f"Protected flood data saved to: {protected_flood_output_path}")
+            except Exception as e:
+                print(f"Error saving protected flood data: {str(e)}")
+                traceback.print_exc()
+
+        print("All datasets successfully loaded, aligned, and flood data filtered by protection levels")
         
         # Convert to dask array for parallel processing
         pop_data = pop_data.chunk({'x': 1000, 'y': 1000})
@@ -715,13 +799,13 @@ def main(scale_factor=None, region_bounds=None, output_dir=None, skip_vis=False,
         # Visualize data alignment if not skipping visualization
         if not skip_vis:
             vis_start = print_timestamp("Starting visualizations")
-            visualize_data_alignment_with_nuts(pop_data, flood_data, income_data, nuts_file, output_dir)
+            visualize_data_alignment_with_nuts(pop_data, flood_data_protected, income_data, nuts_file, output_dir) # Use protected flood data
             print_timestamp("Completed alignment visualization", vis_start)
 
         # Run analysis always with income data
         analysis_start = print_timestamp("Starting population analysis by depth and income")
         nuts_pop_by_depth_income = analyze_population_by_flood_depth_and_income(
-            pop_data, flood_data, income_data=income_data, nuts_file=nuts_file, 
+            pop_data, flood_data_protected, income_data=income_data, nuts_file=nuts_file, # Use protected flood data
             region_name=region_name,
             nuts_level=nuts_level,
             cpu_cores=cpu_cores,
@@ -740,14 +824,14 @@ def main(scale_factor=None, region_bounds=None, output_dir=None, skip_vis=False,
         
         if not skip_vis:
             visualize_population_by_income_and_depth(
-                nuts_pop_by_depth_income, output_dir, flood_filename
+                nuts_pop_by_depth_income, output_dir, flood_filename # flood_filename is for title, analysis uses protected data
             )
         
         print_memory_usage("After visualization")
             
         # Run vulnerability hotspot analysis
         analyze_vulnerable_areas(
-            pop_data, flood_data, income_data, 
+            pop_data, flood_data_protected, income_data, # Use protected flood data
             flood_threshold=flood_threshold if flood_threshold is not None else 1.0,
             income_threshold=income_threshold if income_threshold is not None else 18000,
             output_dir=output_dir, 
@@ -767,6 +851,8 @@ def main(scale_factor=None, region_bounds=None, output_dir=None, skip_vis=False,
             print("  - Flood data could not be loaded")
         if income_data is None:
             print("  - Income data could not be loaded")
+        if protection_data is None:
+            print("  - Protection data could not be loaded")
     print_timestamp("Finished main analysis", start_time)
 
 def analyze_population_by_flood_depth_and_income(population_data, flooding_data, income_data=None, nuts_file=None, 
@@ -1575,12 +1661,16 @@ def setup_logging(output_dir):
     
     # Define cleanup function
     def cleanup_logging():
-        print("\nCleaning up logging resources...")
-        sys.stdout.flush()
+        print("\nCleaning up logging resources...", file=sys.__stdout__)  # Use the original stdout
+        
+        # Safely access the log file
         if hasattr(sys, 'stdout') and hasattr(sys.stdout, 'log'):
-            sys.stdout.log.flush()
-            sys.stdout.log.close()
-        print("Log file closed properly.")
+            if not sys.stdout.log.closed:  # Check if file is already closed
+                sys.stdout.log.flush()
+                sys.stdout.log.close()
+                print("Log file closed properly.", file=sys.__stdout__)
+            else:
+                print("Log file was already closed.", file=sys.__stdout__)
     
     # Register cleanup for normal exits
     atexit.register(cleanup_logging)
@@ -1861,6 +1951,92 @@ def chunk_data(data, chunk_size):
     """Split data into chunks of specified size"""
     for i in range(0, len(data), chunk_size):
         yield data[i:i + chunk_size]
+
+def apply_protection_filter(hazard_data, protection_data, hazard_filename):
+    """
+    Apply the binary \"hold vs breach\" filter to the hazard data based on protection levels.
+
+    Args:
+        hazard_data (xr.DataArray): The original flood hazard GeoTIFF (water depths or binary mask).
+        protection_data (xr.DataArray): The flood protection GeoTIFF (design return period P in years).
+        hazard_filename (str): Filename of the hazard raster, used to extract its RP.
+
+    Returns:
+        xr.DataArray: A new hazard map with protection levels applied.
+    """
+    print(f"\n==== APPLYING FLOOD PROTECTION FILTER ====")
+    print(f"Hazard data shape: {hazard_data.shape}")
+    print(f"Protection data shape: {protection_data.shape}")
+    print(f"Hazard filename: {hazard_filename}")
+
+    # 1. Identify the return period (RP) of the hazard data
+    rp_match = re.search(r'RP(\d+)', hazard_filename, re.IGNORECASE)
+    if not rp_match:
+        print(f"WARNING: Could not parse RP from hazard filename: {hazard_filename}. Assuming RP=0 (no protection effective).")
+        hazard_rp = 0
+    else:
+        hazard_rp = int(rp_match.group(1))
+        print(f"Parsed Hazard Return Period (RP): {hazard_rp} years")
+
+    # Ensure protection_data is in the same shape as hazard_data (it should be after alignment)
+    if hazard_data.shape != protection_data.shape:
+        print(f"ERROR: Hazard data shape {hazard_data.shape} and Protection data shape {protection_data.shape} do not match!")
+        # Attempt to reproject protection_data to match hazard_data as a fallback
+        # This should ideally not happen if align_datasets worked correctly.
+        print("Attempting emergency reprojection of protection_data to match hazard_data...")
+        try:
+            protection_data = protection_data.rio.reproject_match(hazard_data, resampling=rasterio.enums.Resampling.nearest)
+            print(f"Emergency reprojection successful. New protection_data shape: {protection_data.shape}")
+        except Exception as e:
+            print(f"Emergency reprojection failed: {e}. Returning original hazard data.")
+            return hazard_data
+
+    # Create a copy of the hazard data to modify
+    protected_hazard_data = hazard_data.copy()
+
+    # 2. Apply the binary "hold vs breach" filter
+    # Where protection_data (P) >= hazard_rp (RP), defences hold -> set hazard to 0 (no flood)
+    # Where protection_data (P) < hazard_rp (RP), defences breach -> keep original hazard value
+    
+    # Ensure protection_data has no NaNs where hazard_data is valid, fill with 0 (no protection)
+    protection_values = protection_data.fillna(0).values 
+    hazard_values = protected_hazard_data.values
+
+    # Create the mask
+    # Defences hold if protection_level >= hazard_return_period
+    defences_hold_mask = protection_values >= hazard_rp
+    
+    # Apply the filter: set hazard to 0 where defences hold
+    # Ensure we are operating on the correct band if multi-band (typically hazard is single band)
+    if hazard_values.ndim == 3 and hazard_values.shape[0] == 1: # Single band raster
+        hazard_values[0][defences_hold_mask[0]] = 0 
+    elif hazard_values.ndim == 2: # Already 2D array
+         hazard_values[defences_hold_mask[0]] = 0 # Assuming protection_mask is also 2D or compatible
+    else:
+        print(f"WARNING: Hazard data has unexpected dimensions {hazard_values.ndim}. Filter may not apply correctly.")
+        # Attempt to apply to the first band if it's a multi-band array that wasn't caught
+        if hazard_values.ndim > 2 and defences_hold_mask.ndim > 2:
+             hazard_values[0][defences_hold_mask[0]] = 0
+        elif hazard_values.ndim > 2 and defences_hold_mask.ndim == 2: # protection_mask might be 2D
+             hazard_values[0][defences_hold_mask] = 0
+
+
+    protected_hazard_data.values = hazard_values
+    
+    # Log how many cells were affected
+    original_flooded_cells = float((hazard_data > 0).sum())
+    protected_flooded_cells = float((protected_hazard_data > 0).sum())
+    cells_protected = original_flooded_cells - protected_flooded_cells
+    
+    print(f"Original number of flooded cells (>0m): {original_flooded_cells}")
+    print(f"Number of flooded cells after applying protection: {protected_flooded_cells}")
+    if original_flooded_cells > 0:
+        print(f"Cells where flood was mitigated by protection: {cells_protected} ({cells_protected/original_flooded_cells*100:.2f}% of originally flooded)")
+    else:
+        print(f"Cells where flood was mitigated by protection: {cells_protected}")
+
+    print(f"Protected hazard data created with shape: {protected_hazard_data.shape}")
+    return protected_hazard_data
 
 if __name__ == "__main__":
     # For multiprocessing on Windows/Linux
