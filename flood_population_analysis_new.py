@@ -1,5 +1,4 @@
 # Standard library imports
-import argparse
 import multiprocessing
 import os
 import platform
@@ -24,12 +23,6 @@ import rioxarray
 import seaborn as sns
 from shapely.geometry import box
 import xarray as xr
-
-import matplotlib.patheffects as pe
-import multiprocessing
-from multiprocessing import Pool
-from itertools import islice
-import dask.array as da
 
 
 def print_memory_usage(label="Current"):
@@ -87,26 +80,6 @@ signal.signal(signal.SIGTERM, signal_handler)
 
 print("Imported libraries...")
 print("Starting script...")
-
-def parse_arguments():
-    """Parse command-line arguments for the script"""
-    parser = argparse.ArgumentParser(description='Flood population and income vulnerability analysis')
-    parser.add_argument('--bounds', nargs=4, type=float, 
-                        help='Analysis bounds: min_lon min_lat max_lon max_lat')
-    parser.add_argument('--output', type=str, help='Output directory')
-    parser.add_argument('--nuts-level', type=int, default=2, 
-                        help='NUTS level to analyze (0-3)')
-    parser.add_argument('--no-vis', action='store_true', 
-                        help='Skip visualization (data analysis only)')
-    parser.add_argument('--cores', type=int, default=32,
-                        help='Number of CPU cores to use (default: 32)')
-    parser.add_argument('--chunk-size', type=int, default=None,
-                        help='Region processing chunk size (default: auto)')
-    parser.add_argument('--flood-threshold', type=float, default=1.0,
-                        help='Flood depth threshold for vulnerability analysis (default: 1.0m)')
-    parser.add_argument('--income-threshold', type=int, default=18000,
-                        help='Income threshold for vulnerability analysis (default: 18000 Euro)')
-    return parser.parse_args()
 
 def load_population_data(file_path, bounds=None):
     """
@@ -486,197 +459,9 @@ def align_datasets(pop_data, flood_data, income_data, protection_data):
         
         return pop_data, flood_data, income_data, protection_data
 
-def calculate_affected_population(pop_data, flood_data, flood_threshold=0.0):
-    """
-    Calculate population affected by flooding
-    
-    Parameters:
-    - pop_data: xarray DataArray with population counts
-    - flood_data: xarray DataArray with flood extent (values above threshold are considered flooded)
-    - flood_threshold: threshold above which an area is considered flooded
-    
-    Returns:
-    - total_affected: total number of people affected
-    - affected_pop_grid: grid showing affected population
-    """
-    print(f"\n==== CALCULATING AFFECTED POPULATION ====")
-    print(f"Flood threshold: {flood_threshold}")
-    print(f"Population data shape: {pop_data.shape}")
-    print(f"Flood data shape: {flood_data.shape}")
-    
-    # Check for alignment issues
-    if pop_data.shape != flood_data.shape:
-        print(f"WARNING: Dataset shapes don't match!")
-        print(f"  Population coords: x={len(pop_data.x)}, y={len(pop_data.y)}")
-        print(f"  Flood coords: x={len(flood_data.x)}, y={len(flood_data.y)}")
-    
-    # Create a mask of flooded areas
-    flood_mask = flood_data > flood_threshold
-    flooded_cells = flood_mask.sum().values.item()
-    total_cells = flood_mask.size
-    print(f"Flooded cells: {flooded_cells} of {total_cells} ({flooded_cells/total_cells*100:.2f}%)")
-    
-    # Print flood depth distribution
-    flood_data_valid = flood_data.values[~np.isnan(flood_data.values)]
-    if len(flood_data_valid) > 0:
-        flood_depth_bins = [0, 0.1, 0.5, 1.0, 2.0, 5.0, float('inf')]
-        print("Flood depth distribution:")
-        for i in range(len(flood_depth_bins)-1):
-            count = np.sum((flood_data_valid > flood_depth_bins[i]) & (flood_data_valid <= flood_depth_bins[i+1]))
-            if flood_depth_bins[i+1] == float('inf'):
-                print(f"  > {flood_depth_bins[i]}m: {count} cells")
-            else:
-                print(f"  {flood_depth_bins[i]}-{flood_depth_bins[i+1]}m: {count} cells")
-    
-    # Apply mask to population data
-    affected_pop_grid = pop_data.where(flood_mask, 0)
-    
-    # Calculate total affected population
-    total_affected = affected_pop_grid.sum().item()
-    
-    # Calculate total population and percentage
-    total_population = pop_data.sum().item()
-    percentage_affected = (total_affected / total_population) * 100 if total_population > 0 else 0
-    
-    # Detailed population statistics
-    print(f"\nPopulation statistics:")
-    print(f"  Max population in a cell: {float(pop_data.max().values)}")
-    print(f"  Mean population in a cell: {float(pop_data.mean().values)}")
-    print(f"  Median population in a cell: {float(np.nanmedian(pop_data.values))}")
-    print(f"  Cells with population > 0: {(pop_data > 0).sum().values.item()}")
-    print(f"  Cells with population > 100: {(pop_data > 100).sum().values.item()}")
-    print(f"  Cells with population > 1000: {(pop_data > 1000).sum().values.item()}")
-    
-    print(f"\nAffected population statistics:")
-    print(f"  Max affected population in a cell: {float(affected_pop_grid.max().values)}")
-    print(f"  Mean affected population in a cell: {float(affected_pop_grid.mean().values)}")
-    print(f"  Cells with affected population > 0: {(affected_pop_grid > 0).sum().values.item()}")
-    print(f"  Cells with affected population > 100: {(affected_pop_grid > 100).sum().values.item()}")
-    print(f"  Cells with affected population > 1000: {(affected_pop_grid > 1000).sum().values.item()}")
-    
-    print(f"\nTotal population: {total_population:.2f}")
-    print(f"Affected population: {total_affected:.2f} ({percentage_affected:.2f}%)")
-    
-    # If total population seems low, provide a warning
-    if total_population < 5000000 and 'austria' in str(pop_data.attrs).lower():
-        print("\nWARNING: Total population appears low for Austria!")
-        print("  - The SSP datasets might need a scaling factor (e.g., multiply by a constant)")
-        print("  - Check the units in the dataset documentation")
-        print("  - Current value is only about 20% of expected population")
-    
-    return total_affected, affected_pop_grid, percentage_affected
-
-def visualize_results(pop_data, flood_data, affected_pop_grid, output_dir=None, nuts_file=None, flood_filename=None):
-    """
-    Create visualizations of the results with optional NUTS regions overlay
-    
-    Parameters:
-    - pop_data: xarray DataArray with population counts
-    - flood_data: xarray DataArray with flood extent
-    - affected_pop_grid: xarray DataArray with affected population
-    - output_dir: directory to save visualizations
-    - nuts_file: path to NUTS regions GeoJSON file
-    - flood_filename: filename of the flood dataset to extract return period
-    """
-    print("Generating visualizations...")
-    
-    # Extract return period from flood filename if provided
-    flood_title = "Flood Extent"
-    if flood_filename:
-        # Try to extract RP value (return period) from the filename
-        import re
-        rp_match = re.search(r'RP(\d+)', flood_filename, re.IGNORECASE)
-        if rp_match:
-            rp_value = rp_match.group(1)
-            flood_title = f"Flood Extent (RP{rp_value})"
-            print(f"Detected return period: RP{rp_value}")
-    
-    if output_dir:
-        os.makedirs(output_dir, exist_ok=True)
-    
-    # Load NUTS regions if provided
-    nuts_gdf = None
-    if nuts_file and os.path.exists(nuts_file):
-        print(f"Loading NUTS regions from: {nuts_file}")
-        try:
-            nuts_gdf = gpd.read_file(nuts_file)
-            print(f"Loaded {len(nuts_gdf)} NUTS regions")
-        except Exception as e:
-            print(f"Error loading NUTS regions: {str(e)}")
-    
-    # Downsample large datasets before plotting to prevent memory errors
-    print(f"Original data shapes - Population: {pop_data.shape}, Flood: {flood_data.shape}")
-    
-    # If population data is too large, downsample it
-    if pop_data.shape[1] * pop_data.shape[2] > 1000000:  # If more than ~1 million pixels
-        print("Population data is very large. Downsampling for visualization...")
-        # Coarsen by factor of 20 in both dimensions
-        sample_factor = 20
-        pop_data_vis = pop_data.coarsen(y=sample_factor, x=sample_factor).mean()
-        affected_pop_grid_vis = affected_pop_grid.coarsen(y=sample_factor, x=sample_factor).mean()
-        print(f"Downsampled population data shape: {pop_data_vis.shape}")
-    else:
-        pop_data_vis = pop_data
-        affected_pop_grid_vis = affected_pop_grid
-    
-    # If flood data is too large, downsample it too
-    if flood_data.shape[1] * flood_data.shape[2] > 1000000:
-        print("Flood data is very large. Downsampling for visualization...")
-        sample_factor = 10
-        flood_data_vis = flood_data.coarsen(y=sample_factor, x=sample_factor).mean()
-        print(f"Downsampled flood data shape: {flood_data_vis.shape}")
-    else:
-        flood_data_vis = flood_data
-    
-    # Print data ranges for debugging
-    print(f"Population data range: {float(pop_data_vis.min().values)} to {float(pop_data_vis.max().values)}")
-    print(f"Flood data range: {float(flood_data_vis.min().values)} to {float(flood_data_vis.max().values)}")
-    print(f"Affected population range: {float(affected_pop_grid_vis.min().values)} to {float(affected_pop_grid_vis.max().values)}")
-    
-    # Create a figure with 3 subplots
-    fig, axs = plt.subplots(1, 3, figsize=(18, 6))
-    
-    # Plot 1: Population density
-    pop_plot = pop_data_vis.plot(ax=axs[0], cmap='viridis', 
-                            vmin=0, 
-                            add_colorbar=True)
-    axs[0].set_title('Population Density')
-    
-    # Plot 2: Flood extent - use a specific range for flood values
-    # Only show positive values since negative are likely masked nodata
-    flood_min = max(0.0, float(flood_data_vis.min().values))
-    flood_max = float(flood_data_vis.max().values)
-    if not np.isnan(flood_min) and not np.isnan(flood_max) and flood_max > flood_min:
-        flood_plot = flood_data_vis.plot(ax=axs[1], cmap='Blues', 
-                                   vmin=flood_min, vmax=flood_max,
-                                   add_colorbar=True)
-    else:
-        # Fallback if we have invalid min/max
-        flood_plot = flood_data_vis.plot(ax=axs[1], cmap='Blues', add_colorbar=True)
-    axs[1].set_title(flood_title)
-    
-    # Plot 3: Affected population
-    affected_plot = affected_pop_grid_vis.plot(ax=axs[2], cmap='hot_r', 
-                                          vmin=0, 
-                                          add_colorbar=True)
-    axs[2].set_title('Population Affected by Flooding')
-    
-    # Overlay NUTS regions on all plots if available
-    if nuts_gdf is not None:
-        print("Overlaying NUTS regions on plots...")
-        # For each plot, overlay NUTS boundaries
-        for i, ax in enumerate(axs):
-            nuts_gdf.boundary.plot(ax=ax, color='red', linewidth=0.5)
-    
-    plt.tight_layout()
-    
-    if output_dir:
-        plt.savefig(os.path.join(output_dir, 'flood_population_analysis.png'), dpi=300)
-        print(f"Visualization saved to {os.path.join(output_dir, 'flood_population_analysis.png')}")
-
-def main(scale_factor=None, region_bounds=None, output_dir=None, skip_vis=False, 
-         nuts_level=None, cpu_cores=None, chunk_size=None, 
-         flood_threshold=None, income_threshold=None):
+def main(population_file_path: str, income_file_path: str, flood_file_path: str, region_bounds=None, base_output_dir=None, 
+         nuts_level=None, cpu_cores=None, 
+         flood_threshold=None, income_threshold=None): # flood_threshold here is for context if needed, vuln flood is >0m
     """
     Main function to analyze population affected by flooding by depth category and income level
     """
@@ -690,15 +475,16 @@ def main(scale_factor=None, region_bounds=None, output_dir=None, skip_vis=False,
         # Define a SLURM-specific signal handler that logs the event
         def slurm_signal_handler(sig, frame):
             signal_name = signal.Signals(sig).name if hasattr(signal, 'Signals') else f"signal {sig}"
-            print(f"\n[SLURM TERMINATION] Received {signal_name} in job {os.environ.get('SLURM_JOB_ID', 'unknown')}")
+            print(f"\\n[SLURM TERMINATION] Received {signal_name} in job {os.environ.get('SLURM_JOB_ID', 'unknown')}")
             print("[SLURM TERMINATION] Flushing and closing log file")
             sys.stdout.flush()
             
             # Safety: directly flush the global log file handle if available
-            if 'log_file_handle' in globals() and log_file_handle and not log_file_handle.closed:
-                log_file_handle.flush()
-                log_file_handle.write("\n[SLURM TERMINATION] Job ended by SLURM\n")
-                log_file_handle.close()
+            log_handle = globals().get('log_file_handle')
+            if log_handle and not log_handle.closed:
+                log_handle.flush()
+                log_handle.write("\\n[SLURM TERMINATION] Job ended by SLURM\\n")
+                log_handle.close()
                 
             sys.exit(1)
             
@@ -708,38 +494,73 @@ def main(scale_factor=None, region_bounds=None, output_dir=None, skip_vis=False,
     # Automatically determine file paths
     script_dir = os.path.dirname(os.path.abspath(__file__))
     
-    # Population file
-    population_file = os.path.join(script_dir, 'SSP2_2020.tif')
+    # Get basename of the flood file, used later
+    current_flood_filename = os.path.basename(flood_file_path)
     
-    # Flood file
-    flood_file = os.path.join(script_dir, 'Europe_RP500_filled_depth.tif')
-    flood_filename = os.path.basename(flood_file)
-    
-    # Income file 
-    income_file = os.path.join(script_dir, 'Europe_disp_inc_2015.tif')
-    
-    # Protection file
+    # Protection file and NUTS regions file remain the same, relative to script_dir
     protection_file = os.path.join(script_dir, 'floodProtection_v2019_paper', 'floodProtection_v2019_paper3.tif')
-    
-    # NUTS regions file
     nuts_file = os.path.join(script_dir, 'NUTS_RG_01M_2024_4326.geojson')
     
-    # Create output directory if it doesn't exist
-    if output_dir is None:
-        output_dir = os.path.join(script_dir, 'flood_analysis_results_new')
+    # --- Construct the dynamic output directory name ---
+    ssp_name = "unknown_ssp"
+    year = "unknown_year"
+    flood_event_name = "unknown_event"
+
+    try:
+        pop_basename = os.path.basename(population_file_path)
+        # Expects format like "SSPx_xxxx.tif"
+        name_parts = pop_basename.split('.')[0].split('_') 
+        if len(name_parts) >= 1:
+            ssp_name = name_parts[0]
+        if len(name_parts) >= 2:
+            year = name_parts[1]
+        print(f"Parsed from population file ('{pop_basename}'): SSP='{ssp_name}', Year='{year}'")
+    except Exception as e:
+        print(f"Warning: Could not parse SSP/year from population file '{population_file_path}': {e}")
+
+    try:
+        flood_basename = os.path.basename(flood_file_path)
+        # E.g., "Europe_RP10_filled_depth.tif" -> "RP10"
+        name_parts = flood_basename.split('.')[0].split('_')
+        found_rp = False
+        for part in name_parts:
+            if part.startswith("RP") and len(part) > 2 and part[2:].isdigit():
+                flood_event_name = part
+                found_rp = True
+                break
+        if not found_rp: # Fallback if specific RPxxx pattern not found
+            # Attempt to extract a meaningful part if "RP" is not present or not in expected format
+            if "Europe" in name_parts and len(name_parts) > 1: # e.g. Europe_EVENT_something
+                flood_event_name = name_parts[1]
+            elif len(name_parts) > 0: # Take the first part if no "Europe"
+                 flood_event_name = name_parts[0]
+            else: # Use the whole filename without extension if no underscores
+                 flood_event_name = flood_basename.split('.')[0]
+        print(f"Parsed from flood file ('{flood_basename}'): Event='{flood_event_name}'")
+    except Exception as e:
+        print(f"Warning: Could not parse flood event from flood file '{flood_file_path}': {e}")
+
+    if base_output_dir is None:
+        # Default base directory for all results if not specified by the user
+        base_output_dir = os.path.join(script_dir, 'analysis_runs_output') 
     
-    os.makedirs(output_dir, exist_ok=True)
+    # Construct specific output directory name for this combination
+    specific_run_output_dir_name = f"results_{ssp_name}_{year}_{flood_event_name}"
+    output_dir_for_this_run = os.path.join(base_output_dir, specific_run_output_dir_name)
     
-    # Set up logging to capture console output to a file
-    log_file = setup_logging(output_dir)
+    os.makedirs(output_dir_for_this_run, exist_ok=True)
+    
+    # Set up logging to capture console output to a file in the new specific directory
+    # Ensure setup_logging is defined and handles the log file (e.g., by setting a global 'log_file_handle')
+    log_file = setup_logging(output_dir_for_this_run) 
     
     # Print the paths being used
-    print(f"Using population data: {population_file}")
-    print(f"Using flood data: {flood_file}")
-    print(f"Using income data: {income_file}")
+    print(f"Using population data: {population_file_path}")
+    print(f"Using flood data: {flood_file_path}")
+    print(f"Using income data: {income_file_path}")
     print(f"Using protection data: {protection_file}")
     print(f"Using NUTS regions: {nuts_file}")
-    print(f"Output will be saved to: {output_dir}")
+    print(f"Output will be saved to: {output_dir_for_this_run}")
     
     # Use the region bounds from arguments or default to Europe
     if region_bounds is None:
@@ -753,13 +574,13 @@ def main(scale_factor=None, region_bounds=None, output_dir=None, skip_vis=False,
     
     # Load all datasets
     loading_start = print_timestamp("Starting data loading")
-    pop_data = load_population_data(population_file, bounds=region_bounds)
+    pop_data = load_population_data(population_file_path, bounds=region_bounds)
     print_timestamp("Loaded population data", loading_start)
 
-    flood_data = load_flood_data(flood_file, bounds=region_bounds)
+    flood_data = load_flood_data(flood_file_path, bounds=region_bounds)
     print_timestamp("Loaded flood data", loading_start)
 
-    income_data = load_income_data(income_file, bounds=region_bounds)
+    income_data = load_income_data(income_file_path, bounds=region_bounds)
     print_timestamp("Loaded income data", loading_start)
     
     protection_data = load_protection_data(protection_file, bounds=region_bounds)
@@ -776,16 +597,19 @@ def main(scale_factor=None, region_bounds=None, output_dir=None, skip_vis=False,
         
         # Apply flood protection filter
         filter_start = print_timestamp("Starting flood protection filter")
-        flood_data_protected = apply_protection_filter(flood_data, protection_data, flood_filename)
+        flood_data_protected = apply_protection_filter(flood_data, protection_data, current_flood_filename)
         print_memory_usage("After applying protection filter")
         print_timestamp("Completed flood protection filter", filter_start)
 
         # Save the protected flood data
-        if output_dir:
-            protected_flood_output_path = os.path.join(output_dir, f"{os.path.splitext(flood_filename)[0]}_protected.tif")
+        if output_dir_for_this_run:
+            protected_flood_output_path = os.path.join(output_dir_for_this_run, f"{os.path.splitext(current_flood_filename)[0]}_protected.tif")
             try:
-                flood_data_protected.rio.to_raster(protected_flood_output_path, compress='LZW', dtype='float32')
-                print(f"Protected flood data saved to: {protected_flood_output_path}")
+                if hasattr(flood_data_protected, 'rio'):
+                    flood_data_protected.rio.to_raster(protected_flood_output_path, compress='LZW', dtype='float32')
+                    print(f"Protected flood data saved to: {protected_flood_output_path}")
+                else:
+                    print("Warning: flood_data_protected does not have rio accessor, cannot save as raster.")
             except Exception as e:
                 print(f"Error saving protected flood data: {str(e)}")
                 traceback.print_exc()
@@ -793,56 +617,67 @@ def main(scale_factor=None, region_bounds=None, output_dir=None, skip_vis=False,
         print("All datasets successfully loaded, aligned, and flood data filtered by protection levels")
         
         # Convert to dask array for parallel processing
-        pop_data = pop_data.chunk({'x': 1000, 'y': 1000})
-        # Operations will now utilize multiple cores automatically
+        if hasattr(pop_data, 'chunk'): # Ensure pop_data is an xarray DataArray
+             pop_data = pop_data.chunk({'x': 1000, 'y': 1000})
         
-        # Visualize data alignment if not skipping visualization
-        if not skip_vis:
-            vis_start = print_timestamp("Starting visualizations")
-            visualize_data_alignment_with_nuts(pop_data, flood_data_protected, income_data, nuts_file, output_dir) # Use protected flood data
-            print_timestamp("Completed alignment visualization", vis_start)
+        # Visualize data alignment
+        vis_start = print_timestamp("Starting visualizations")
+        visualize_data_alignment_with_nuts(pop_data, flood_data_protected, income_data, nuts_file, output_dir_for_this_run) 
+        print_timestamp("Completed alignment visualization", vis_start)
 
-        # Run analysis always with income data
+        # Run analysis
         analysis_start = print_timestamp("Starting population analysis by depth and income")
+        
+        # Determine the thresholds to use, with defaults if None
+        # current_flood_threshold_context is passed for context if needed elsewhere by process_region_with_income,
+        # but process_region_with_income will use >0 for the vulnerability flood condition itself.
+        current_flood_threshold_context = flood_threshold if flood_threshold is not None else 1.0 
+        current_income_threshold_vuln = income_threshold if income_threshold is not None else 18000
+
         nuts_pop_by_depth_income = analyze_population_by_flood_depth_and_income(
-            pop_data, flood_data_protected, income_data=income_data, nuts_file=nuts_file, # Use protected flood data
+            pop_data, flood_data_protected, income_data=income_data, nuts_file=nuts_file, 
             region_name=region_name,
             nuts_level=nuts_level,
             cpu_cores=cpu_cores,
-            chunk_size=chunk_size
+            flood_threshold_vuln_context=current_flood_threshold_context, # Pass contextual flood threshold
+            income_threshold_vuln=current_income_threshold_vuln # Pass vulnerability income threshold
         )
         print_timestamp("Completed population analysis", analysis_start)
         
         print_memory_usage("After main analysis")
 
         # Save income-stratified results to GeoJSON for GIS applications
-        if output_dir:
+        if output_dir_for_this_run and nuts_pop_by_depth_income is not None:
             print("Saving results to GeoJSON...")
-            geojson_path = os.path.join(output_dir, 'europe_flood_depth_income_analysis.geojson')
+            geojson_path = os.path.join(output_dir_for_this_run, f'analysis_results_{ssp_name}_{year}_{flood_event_name}.geojson')
             nuts_pop_by_depth_income.to_file(geojson_path, driver='GeoJSON')
             print(f"GeoJSON results with income analysis saved to {geojson_path}")
         
-        if not skip_vis:
+        if nuts_pop_by_depth_income is not None:
             visualize_population_by_income_and_depth(
-                nuts_pop_by_depth_income, output_dir, flood_filename # flood_filename is for title, analysis uses protected data
+                nuts_pop_by_depth_income, output_dir_for_this_run, current_flood_filename 
+            )
+        print_memory_usage("After visualization")
+
+        # Call the refactored visualization function for vulnerable areas
+        if nuts_pop_by_depth_income is not None:
+            visualize_vulnerable_areas(
+                results_gdf=nuts_pop_by_depth_income,
+                flood_threshold=0.0, # Explicitly use 0.0 to signify "any flooding > 0m" for visualization title
+                income_threshold=current_income_threshold_vuln,
+                output_dir=output_dir_for_this_run, 
+                flood_filename=current_flood_filename,
+                nuts_file=nuts_file, # Optional, for context in plot
+                nuts_level=nuts_level  # Optional, for context
             )
         
-        print_memory_usage("After visualization")
-            
-        # Run vulnerability hotspot analysis
-        analyze_vulnerable_areas(
-            pop_data, flood_data_protected, income_data, # Use protected flood data
-            flood_threshold=flood_threshold if flood_threshold is not None else 1.0,
-            income_threshold=income_threshold if income_threshold is not None else 18000,
-            output_dir=output_dir, 
-            flood_filename=flood_filename,
-            nuts_file=nuts_file,
-            nuts_level=nuts_level
-        )
-        
-        print("\n====== ANALYSIS COMPLETE ======")
-        print(f"Results saved to {output_dir}")
-        print(f"Log file saved to {log_file}")
+        print("\\n====== ANALYSIS COMPLETE ======")
+        print(f"Results saved to {output_dir_for_this_run}")
+        if log_file: # Check if log_file was successfully created by setup_logging
+             print(f"Log file saved to {log_file if isinstance(log_file, str) else getattr(log_file, 'name', 'unknown_log_file_path')}")
+
+        # Final memory usage report
+        print_memory_usage("End of script")
     else:
         print("Error: Failed to load required datasets.")
         if pop_data is None:
@@ -855,14 +690,16 @@ def main(scale_factor=None, region_bounds=None, output_dir=None, skip_vis=False,
             print("  - Protection data could not be loaded")
     print_timestamp("Finished main analysis", start_time)
 
-def analyze_population_by_flood_depth_and_income(population_data, flooding_data, income_data=None, nuts_file=None, 
-                                               region_name=None, nuts_level=None, cpu_cores=None, chunk_size=None):
+def analyze_population_by_flood_depth_and_income(population_data, flooding_data, income_data, nuts_file=None, 
+                                               region_name=None, nuts_level=None, cpu_cores=None,
+                                               flood_threshold_vuln_context=1.0, income_threshold_vuln=18000): # Added vuln thresholds
     """
     Analyze how many people are affected by different flood depth ranges with optional income stratification
     Uses threading for parallel region processing (safer than multiprocessing)
+    Also calculates vulnerability based on income_threshold_vuln and flood > 0m.
+    flood_threshold_vuln_context is passed for potential other uses but not for the primary vuln flood condition.
     """
-    print(f"\n==== ANALYZING POPULATION BY FLOOD DEPTH" + 
-          (f" AND INCOME ====" if income_data is not None else " ===="))
+    print(f"\n==== ANALYZING POPULATION BY FLOOD DEPTH AND INCOME ====")
     
     # Define the flood depth ranges (in meters)
     global depth_ranges
@@ -897,20 +734,14 @@ def analyze_population_by_flood_depth_and_income(population_data, flooding_data,
     study_regions = nuts_level_regions[nuts_level_regions['intersects_study_area']].copy()
     print(f"Found {len(study_regions)} NUTS level {nuts_level} regions that intersect with the study area")
 
-    # If no regions found, fall back to using all regions
     if len(study_regions) == 0:
-        print(f"Warning: No NUTS level {nuts_level} regions found in study area. Using all available regions.")
-        study_regions = nuts_gdf
-        print(f"Using {len(study_regions)} regions")
+        print(f"Warning: No NUTS level {nuts_level} regions found in study area.")
 
-    # Make data globally accessible for multi-processing
+    # Make data globally accessible for worker threads
     global pop_data, flood_data, income_data_global
     pop_data = population_data
     flood_data = flooding_data
-    
-    # Only set income data if provided
-    if income_data is not None:
-        income_data_global = income_data
+    income_data_global = income_data
     
     # Set up threading pool parameters
     slurm_cpus = os.environ.get('SLURM_CPUS_PER_TASK')
@@ -922,18 +753,18 @@ def analyze_population_by_flood_depth_and_income(population_data, flooding_data,
         print(f"Using {num_cores} threads of {multiprocessing.cpu_count()} available CPU cores")
     
     # Prepare data for parallel processing
-    region_data = [(idx, region) for idx, region in study_regions.iterrows()]
-    total_regions = len(region_data)
-
-    # Calculate chunk size based on data size and CPU cores
-    if chunk_size is None:
-        chunk_size = max(1, len(region_data) // (num_cores * 4))
+    # region_data = [(idx, region) for idx, region in study_regions.iterrows()] # Old
+    region_processing_tuples = []
+    for idx, region_obj_iter in study_regions.iterrows():
+        # Pass the income threshold for vulnerability. The flood threshold for vulnerability is handled as >0 internally
+        # in process_region_with_income. flood_threshold_vuln_context is passed along.
+        region_processing_tuples.append( (idx, region_obj_iter, flood_threshold_vuln_context, income_threshold_vuln) )
     
-    print(f"Processing {len(region_data)} regions in chunks of {chunk_size}")
+    total_regions = len(region_processing_tuples)
+
     result_data = []
 
     start_time = time.time()
-    processed_count = 0
 
     from concurrent.futures import ThreadPoolExecutor  # Changed from ProcessPoolExecutor
 
@@ -948,7 +779,7 @@ def analyze_population_by_flood_depth_and_income(population_data, flooding_data,
     with ThreadPoolExecutor(max_workers=num_cores) as executor:
         # Add robust exception handling
         try:
-            print(f"👉 Starting executor with {num_cores} threads for {len(region_data)} regions")
+            print(f"👉 Starting executor with {num_cores} threads for {len(region_processing_tuples)} regions")
             
             # Process results as they complete
             result_data = []
@@ -956,15 +787,21 @@ def analyze_population_by_flood_depth_and_income(population_data, flooding_data,
             
             # Submit tasks to the executor
             print("Submitting tasks to executor...")
-            for i, region in enumerate(region_data):
-                idx, region_obj = region
+            # for i, region in enumerate(region_data): # Old
+            #     idx, region_obj = region # Old
+            #     region_name = region_obj.get('NAME_LATN', region_obj.get('NUTS_NAME', f'Unknown-{idx}')) # Old
+            #     future = executor.submit(process_region_with_income, region) # Old
+            #     futures.append((future, region_name)) # Old
+
+            for i, task_data_tuple in enumerate(region_processing_tuples):
+                idx, region_obj, _, _ = task_data_tuple # unpack to get region_obj for name
                 region_name = region_obj.get('NAME_LATN', region_obj.get('NUTS_NAME', f'Unknown-{idx}'))
-                future = executor.submit(process_region_with_income, region)
+                future = executor.submit(process_region_with_income, task_data_tuple) # Pass the whole tuple
                 futures.append((future, region_name))
                 
                 # Print only occasionally to avoid flooding logs
-                if i % 10 == 0 or i == len(region_data) - 1:
-                    print(f"  Submitted {i+1}/{len(region_data)} regions")
+                if i % 10 == 0 or i == len(region_processing_tuples) - 1:
+                    print(f"  Submitted {i+1}/{len(region_processing_tuples)} regions")
             
             # Process results with better error handling and timeouts
             from concurrent.futures import as_completed, TimeoutError
@@ -978,7 +815,7 @@ def analyze_population_by_flood_depth_and_income(population_data, flooding_data,
                 try:
                     print(f"⏳ Waiting for result from region: {region_name} ({i+1}/{total})")
                     # Set a timeout per future to prevent hanging on any single one
-                    result = future.result(timeout=600)  # 10-minute timeout per region
+                    result = future.result(timeout=6000)  # 100-minute timeout per region
                     
                     if result:
                         result_data.append(result)
@@ -999,7 +836,7 @@ def analyze_population_by_flood_depth_and_income(population_data, flooding_data,
             print(f"🏁 All regions processed. Completing analysis...")
             
         except Exception as e:
-            print(f"⚠️ ERROR in parallel processing: {str(e)}")
+            print(f"⚠️ ERROR in processing: {str(e)}")
             traceback.print_exc()
             result_data = []
 
@@ -1012,7 +849,7 @@ def analyze_population_by_flood_depth_and_income(population_data, flooding_data,
     gc.collect()
     print_memory_usage("FINAL STATE")
 
-    # Continue with the rest of the function - create GeoDataFrame from results
+    # Print final processing time
     total_time = time.time() - start_time
     hours = int(total_time // 3600)
     minutes = int((total_time % 3600) // 60)
@@ -1082,23 +919,11 @@ def analyze_population_by_flood_depth_and_income(population_data, flooding_data,
         print("\nThe following regions were NOT successfully processed:")
         for i, (name, nuts_id) in enumerate(missing_regions.items(), 1):
             print(f"  {i}. {name} (ID: {nuts_id})")
-    
-    # Print detailed region processing report
-    print("\n==== DETAILED REGION PROCESSING REPORT ====\n")
-    print(f"Total regions in study area: {len(all_regions)}")
-    print(f"Successfully processed: {len(processed_regions)} ({len(processed_regions)/len(all_regions)*100:.1f}%)")
-    print(f"Failed or skipped: {len(missing_regions)} ({len(missing_regions)/len(all_regions)*100:.1f}%)\n")
-    
-    if missing_regions:
-        print("The following regions were NOT successfully processed:")
-        for i, (name, nuts_id) in enumerate(missing_regions.items(), 1):
-            print(f"  {i}. {name} (ID: {nuts_id})")
             
     print("\nSuccessfully processed regions:")
     for i, (name, nuts_id) in enumerate(processed_regions.items(), 1):
         print(f"  {i}. {name} (ID: {nuts_id})")
     
-    print("\n==== END OF DETAILED REGION PROCESSING REPORT ====")
     print("\n==== END OF REGION PROCESSING REPORT ====\n")
     
     return result_gdf
@@ -1256,11 +1081,11 @@ def visualize_population_by_income_and_depth(nuts_pop_by_depth_income, output_di
         cbar_kws={'label': 'Population Affected'},
     )
     
-    plt.title(f"{flood_title}\n{region_display} Population by Income Level and Flood Depth")
+    plt.title(f"{flood_title}\\n{region_display} Population by Income Level and Flood Depth")
     plt.tight_layout()
     
-    if output_dir:
-        plt.savefig(os.path.join(output_dir, f'{region_name}_income_depth_heatmap.png'), dpi=300, bbox_inches='tight')
+    # if output_dir:
+    #     plt.savefig(os.path.join(output_dir, f'{region_name}_income_depth_heatmap.png'), dpi=300, bbox_inches='tight')
     
     # 3. VISUALIZATION: Percentage of income groups affected by each depth category
     # Calculate what percentage of each income group is affected at each depth
@@ -1274,22 +1099,22 @@ def visualize_population_by_income_and_depth(nuts_pop_by_depth_income, output_di
     for col in percentage_impact_df.columns:
         percentage_impact_df[col] = (percentage_impact_df[col] / income_totals[col] * 100).round(2)
     
-    plt.figure(figsize=(12, 8))
+    # plt.figure(figsize=(12, 8))
     
     # Use a diverging colormap to emphasize differences in vulnerability
-    sns.heatmap(
-        percentage_impact_df,
-        cmap='RdBu_r',  # Red for high impact (more vulnerable)
-        annot=True,
-        fmt='.2f',  # Show with 2 decimal places
-        cbar_kws={'label': '% of Income Group Affected'},
-    )
+    # sns.heatmap(
+    #     percentage_impact_df,
+    #     cmap='RdBu_r',  # Red for high impact (more vulnerable)
+    #     annot=True,
+    #     fmt='.2f',  # Show with 2 decimal places
+    #     cbar_kws={'label': '% of Income Group Affected'},
+    # )
     
-    plt.title(f"{flood_title}\nPercentage of Each Income Group Affected by Flood Depth in {region_display}")
-    plt.tight_layout()
+    # plt.title(f"{flood_title}\\nPercentage of Each Income Group Affected by Flood Depth in {region_display}")
+    # plt.tight_layout()
     
-    if output_dir:
-        plt.savefig(os.path.join(output_dir, f'{region_name}_income_vulnerability.png'), dpi=300, bbox_inches='tight')
+    # if output_dir:
+    #     plt.savefig(os.path.join(output_dir, f'{region_name}_income_vulnerability.png'), dpi=300, bbox_inches='tight')
     
     # 4. Save data as CSV for further analysis
     if output_dir:
@@ -1297,12 +1122,12 @@ def visualize_population_by_income_and_depth(nuts_pop_by_depth_income, output_di
         filtered_regions.drop(columns=['geometry']).to_csv(csv_path, index=False)
         
         # Also save the heatmap data
-        heatmap_csv = os.path.join(output_dir, f'{region_name}_income_depth_matrix.csv')
-        heatmap_df.to_csv(heatmap_csv)
+        # heatmap_csv = os.path.join(output_dir, f'{region_name}_income_depth_matrix.csv')
+        # heatmap_df.to_csv(heatmap_csv)
         
         # And the percentage impact data
-        impact_csv = os.path.join(output_dir, f'{region_name}_income_vulnerability_matrix.csv')
-        percentage_impact_df.to_csv(impact_csv)
+        # impact_csv = os.path.join(output_dir, f'{region_name}_income_vulnerability_matrix.csv')
+        # percentage_impact_df.to_csv(impact_csv)
         
         print(f"{region_display} income analysis results saved to {csv_path}")
     
@@ -1410,8 +1235,8 @@ def visualize_data_alignment_with_nuts(pop_data, flood_data, income_data, nuts_f
         plt.tight_layout()
         
         if output_dir is not None:
-            plt.savefig(os.path.join(output_dir, 'vienna_alignment_check.png'), dpi=300)
-            print(f"Vienna alignment check saved to {os.path.join(output_dir, 'vienna_alignment_check.png')}")
+            plt.savefig(os.path.join(output_dir, 'vienna_data_alignment.png'), dpi=300, bbox_inches='tight')
+            print(f"Vienna alignment visualization saved to {os.path.join(output_dir, 'vienna_data_alignment.png')}")
             
         # Close figure to free memory
         plt.close(fig_vienna)
@@ -1420,209 +1245,131 @@ def visualize_data_alignment_with_nuts(pop_data, flood_data, income_data, nuts_f
         print("Vienna region not found in NUTS data - skipping Vienna-specific alignment check")
         
     # Free memory
-    import gc
     gc.collect()
     print_memory_usage("After Vienna visualization")
 
-def analyze_vulnerable_areas(pop_data, flood_data, income_data, flood_threshold=1.0, income_threshold=15000, output_dir=None, flood_filename=None, nuts_file=None, nuts_level=None):
+def visualize_vulnerable_areas(results_gdf, flood_threshold=0.0, income_threshold=15000, output_dir=None, flood_filename=None, nuts_file=None, nuts_level=None):
     """
-    Identify and visualize areas where flooding exceeds a threshold depth AND income is below a threshold
-    These represent especially vulnerable populations
+    Visualize areas where flooding exceeds a threshold depth AND income is below a threshold,
+    using pre-calculated data from results_gdf.
     
     Parameters:
-    Parameters:
-    - pop_data: xarray DataArray with population counts
-    - flood_data: xarray DataArray with flood extent
-    - income_data: xarray DataArray with income data (in PPP - Purchasing Power Parity)
-    - flood_threshold: threshold above which an area is considered flooded
-    - income_threshold: threshold below which income is considered low (in PPP)
+    - results_gdf: GeoDataFrame with analysis results including vulnerability metrics
+                   (e.g., 'vulnerable_pop_thresh', 'total_population', 'vulnerable_pct_thresh').
+    - flood_threshold: Threshold used for vulnerability calculation (for titles/labels). 
+                       A value of 0.0 indicates "any flooding (depth > 0m)".
+    - income_threshold: Threshold used for vulnerability calculation (for titles/labels).
     - output_dir: directory to save visualizations
-    - flood_filename: filename of the flood dataset to extract return period
-    - nuts_file: path to NUTS regions GeoJSON file
+    - flood_filename: filename of the flood dataset to extract return period (for titles)
+    - nuts_file: path to NUTS regions GeoJSON file (optional, for map context)
+    - nuts_level: NUTS level used (optional, for context)
     """
-    print("\n==== VULNERABLE AREAS ANALYSIS ====")
-    print(f"Identifying areas where:")
-    print(f"  - Flood depth > {flood_threshold}m")
-    print(f"  - Income < {income_threshold} PPP")
+    print("\n==== VISUALIZING VULNERABLE AREAS (FROM PRE-CALCULATED DATA) ====")
+    print(f"Visualizing based on thresholds: Flood > {flood_threshold}m & Income < {income_threshold} PPP")
 
-    # Initialize variables
-    vulnerable_pop = 0
-    total_vulnerable_pop = 0
-    
-    # Parallelized approach for larger regions
-    if nuts_file:
-        # Load NUTS regions
-        global nuts_gdf, pop_data_global, flood_data_global, income_data_global
-        
-        nuts_gdf = gpd.read_file(nuts_file)
-        pop_data_global = pop_data
-        flood_data_global = flood_data
-        income_data_global = income_data
-        
-        # Filter to NUTS2 regions
-        study_regions = nuts_gdf[nuts_gdf['LEVL_CODE'] == nuts_level]
-        
-        # Make sure regions intersect with our data
-        x_min, y_min, x_max, y_max = (
-            float(pop_data.x.min().values),
-            float(pop_data.y.min().values),
-            float(pop_data.x.max().values),
-            float(pop_data.y.max().values)
-        )
-        study_area_poly = box(x_min, y_min, x_max, y_max)
-        study_regions = study_regions[study_regions.geometry.intersects(study_area_poly)]
-        
-        # Set up processing parameters
-        region_data = [(idx, region, flood_threshold, income_threshold) 
-                      for idx, region in study_regions.iterrows()]
-        total_regions = len(region_data)
+    if results_gdf is None or results_gdf.empty:
+        print("No data provided for vulnerability visualization. Skipping.")
+        return 0
 
-        start_time = time.time()
-        
-        # Use ThreadPoolExecutor instead of Pool
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        
-        # Determine number of cores to use
-        slurm_cpus = os.environ.get('SLURM_CPUS_PER_TASK')
-        if slurm_cpus:
-            num_cores = int(slurm_cpus)
-            print(f"Using {num_cores} threads allocated by SLURM for vulnerability analysis")
-        else:
-            num_cores = multiprocessing.cpu_count()
-            print(f"Using {num_cores} threads for vulnerability analysis")
-        
-        print_memory_usage("Before vulnerability analysis")
-        
-        # Process regions using ThreadPoolExecutor
-        results = []
-        with ThreadPoolExecutor(max_workers=num_cores) as executor:
-            print(f"👉 Starting vulnerability analysis with {num_cores} threads for {len(region_data)} regions")
-            
-            # Submit all tasks to the executor
-            futures = {executor.submit(process_vulnerable_region, region): i for i, region in enumerate(region_data)}
-            
-            # Track completion and process results
-            completed = 0
-            for future in as_completed(futures):
-                region_idx = futures[future]
-                region_name = region_data[region_idx][1].get('NAME_LATN', 
-                                                            region_data[region_idx][1].get('NUTS_NAME', 
-                                                                                         f'Region-{region_idx}'))
-                try:
-                    result = future.result()
-                    if result:
-                        results.append(result)
-                    
-                    completed += 1
-                    if completed % 5 == 0 or completed == len(futures):
-                        percent_complete = (completed / total_regions) * 100
-                        
-                        # Calculate ETA
-                        elapsed_time = time.time() - start_time
-                        if completed > 0:
-                            time_per_region = elapsed_time / completed
-                            regions_remaining = total_regions - completed
-                            eta_seconds = time_per_region * regions_remaining
-                            eta_str = f"{int(eta_seconds//3600):02d}:{int((eta_seconds%3600)//60):02d}:{int(eta_seconds%60):02d}"
-                            print(f"Vulnerability analysis progress: {completed}/{total_regions} regions ({percent_complete:.1f}%) - ETA: {eta_str}")
-                        
-                        import gc
-                        # Force garbage collection
-                        gc.collect()
-                        print_memory_usage("During vulnerability analysis")
-                        
-                except Exception as e:
-                    print(f"⚠️ Error processing region {region_name} for vulnerability: {str(e)}")
-        
-        total_time = time.time() - start_time
-        hours = int(total_time // 3600)
-        minutes = int((total_time % 3600) // 60)
-        seconds = int(total_time % 60)
-        print(f"Vulnerability analysis completed: {len(results)}/{total_regions} regions in {hours:02d}:{minutes:02d}:{seconds:02d}")
-        
-        # Combine results
-        total_vulnerable_pop = sum(r['vulnerable_population'] for r in results if r is not None)
-        total_pop = sum(r['total_population'] for r in results if r is not None)
-        
-        # Create a visualization
-        fig, ax = plt.subplots(1, 1, figsize=(12, 10))
-        
-        # Create a GeoDataFrame with vulnerability percentages
-        vuln_gdf = gpd.GeoDataFrame(
-            [{
-                'region_name': r['region_name'],
-                'vulnerable_population': r['vulnerable_population'],
-                'total_population': r['total_population'],
-                'vulnerable_percentage': r['vulnerable_percentage'],
-                'geometry': next(reg.geometry for idx, reg in study_regions.iterrows() 
-                               if reg.get('NUTS_ID', '') == r['nuts_id'])
-            } for r in results if r is not None and r['total_population'] > 0],
-            geometry='geometry',
-            crs=study_regions.crs
-        )
-        
-        # Plot the map
-        vuln_plot = vuln_gdf.plot(
-            column='vulnerable_percentage',
-            ax=ax,
-            legend=True,
-            cmap='YlOrRd',
-            alpha=0.7,
-            edgecolor='black',
-            linewidth=0.5,
-            legend_kwds={'label': 'Percentage of Population (%)', 
-                         'orientation': 'horizontal',
-                         'shrink': 0.8,
-                         'pad': 0.05}
-        )
-        
-        # Add map annotations
-        ax.set_title(f"Vulnerable Population by Region\n(Areas with Flood Depth > {flood_threshold:.1f}m & Income < {income_threshold:,.0f} PPP)", 
-                    fontsize=14, pad=20)
-        
-        # Add explanatory text box
-        ax.text(0.02, 0.02, 
-                f"This map shows the percentage of each region's population that is considered vulnerable.\n"
-                f"Vulnerability is defined as people living in areas where:\n"
-                f"• Flood depth exceeds {flood_threshold:.1f}m\n"
-                f"• Income is below {income_threshold:,.0f} PPP\n\n"
-                f"Darker colors indicate regions with higher percentages of vulnerable population.",
-                transform=ax.transAxes, fontsize=10, 
-                bbox=dict(facecolor='white', alpha=0.8, boxstyle='round,pad=0.5'),
-                verticalalignment='bottom')
-        
-        # Add analysis info
-        total_vuln_percent = sum(r['vulnerable_population'] for r in results if r is not None) / sum(r['total_population'] for r in results if r is not None and r['total_population'] > 0) * 100
-        ax.text(0.98, 0.98, 
-                f"Total: {total_vuln_percent:.2f}% of population\n"
-                f"across all regions is vulnerable",
-                transform=ax.transAxes, fontsize=11, 
-                bbox=dict(facecolor='white', alpha=0.8, boxstyle='round,pad=0.3'),
-                horizontalalignment='right', verticalalignment='top')
-        
-        # Adjust layout
-        plt.tight_layout()
-        
-        if output_dir:
-            plt.savefig(os.path.join(output_dir, 'vulnerability_by_region.png'), dpi=300, bbox_inches='tight')
-            vuln_gdf.drop(columns=['geometry']).to_csv(
-                os.path.join(output_dir, 'vulnerability_by_region.csv'), index=False)
-        
-            print(f"Vulnerability results saved to {os.path.join(output_dir, 'vulnerability_by_region.csv')}")
+    # Ensure required columns exist for vulnerability plotting
+    # Expected columns from process_region_with_income: 'vulnerable_pop_thresh', 'total_population', 'vulnerable_pct_thresh'
+    required_vuln_cols = ['vulnerable_pop_thresh', 'total_population', 'vulnerable_pct_thresh', 'geometry', 'region_name', 'nuts_id']
+    missing_cols = [col for col in required_vuln_cols if col not in results_gdf.columns]
+    if missing_cols:
+        print(f"ERROR: results_gdf is missing required columns for vulnerability visualization: {missing_cols}")
+        print(f"Available columns: {results_gdf.columns.tolist()}")
+        return 0 # Or handle error appropriately
     
-    # If you also want to calculate vulnerable population for the entire area (non-region-specific)
-    # Create masks for the entire dataset
-    flood_mask = flood_data > flood_threshold
-    income_mask = income_data < income_threshold
-    combined_mask = flood_mask & income_mask
+    # Filter out regions with no population for plotting to avoid division by zero in percentages or an empty plot
+    vuln_gdf_plot = results_gdf[results_gdf['total_population'] > 0].copy()
+
+    if vuln_gdf_plot.empty:
+        print("No regions with population > 0 to plot for vulnerability. Skipping plot.")
+        # Still return the sum from the original GDF if needed
+        total_vulnerable_pop_all_regions = results_gdf['vulnerable_pop_thresh'].sum()
+        print(f"Total vulnerable population across all regions (from GDF): {total_vulnerable_pop_all_regions:,.0f}")
+        return total_vulnerable_pop_all_regions
+
+
+    # Create a visualization
+    fig, ax = plt.subplots(1, 1, figsize=(12, 10))
     
-    # Calculate total vulnerable population across entire area
-    vulnerable_pop = float(pop_data.where(combined_mask, 0).sum().values)
+    # Plot the map
+    vuln_gdf_plot.plot(
+        column='vulnerable_pct_thresh', # This column is now calculated in process_region_with_income
+        ax=ax,
+        legend=True,
+        cmap='YlOrRd',
+        alpha=0.7,
+        edgecolor='black',
+        linewidth=0.5,
+        legend_kwds={'label': 'Percentage of Vulnerable Population (%)', 
+                     'orientation': 'horizontal',
+                     'shrink': 0.8,
+                     'pad': 0.05},
+        missing_kwds={
+            "color": "lightgrey",
+            "edgecolor": "red",
+            "hatch": "///",
+            "label": "No Data / Pop Zero",
+        }
+    )
     
-    print(f"Total vulnerable population: {total_vulnerable_pop:,.2f} (from regions)")
-    print(f"Global vulnerable population: {vulnerable_pop:,.2f} (from entire area)")
+    flood_condition_text = f"Flood Depth > {flood_threshold:.1f}m"
+    if flood_threshold == 0.0:
+        flood_condition_text = "Any Flooding (Depth > 0m)"
+
+    ax.set_title(f"Vulnerable Population by Region\n({flood_condition_text} & Income < {income_threshold:,.0f} PPP)", 
+                fontsize=14, pad=20)
+    
+    # Add explanatory text box
+    ax.text(0.02, 0.02, 
+            f"Percentage of each region's population vulnerable to:\n"
+            f"• {flood_condition_text}\n"
+            f"• Income < {income_threshold:,.0f} PPP",
+            transform=ax.transAxes, fontsize=10, 
+            bbox=dict(facecolor='white', alpha=0.8, boxstyle='round,pad=0.5'),
+            verticalalignment='bottom')
+    
+    # Add analysis info for plotted regions
+    total_pop_all_regions_plot = vuln_gdf_plot['total_population'].sum()
+    total_vulnerable_pop_all_regions_plot = vuln_gdf_plot['vulnerable_pop_thresh'].sum()
+    
+    overall_vulnerable_pct_plot = (total_vulnerable_pop_all_regions_plot / total_pop_all_regions_plot * 100) if total_pop_all_regions_plot > 0 else 0
+    
+    ax.text(0.98, 0.98, 
+            f"Overall (plotted regions): {overall_vulnerable_pct_plot:.2f}%\n"
+            f"({total_vulnerable_pop_all_regions_plot:,.0f} people) vulnerable",
+            transform=ax.transAxes, fontsize=11, 
+            bbox=dict(facecolor='white', alpha=0.8, boxstyle='round,pad=0.3'),
+            horizontalalignment='right', verticalalignment='top')
+    
+    # Adjust layout
+    plt.tight_layout()
+    
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+        plot_filename = f'vulnerability_by_region_{flood_filename}.png' if flood_filename else 'vulnerability_by_region.png'
+        plot_path = os.path.join(output_dir, plot_filename)
+        
+        csv_filename = f'vulnerability_summary_by_region_{flood_filename}.csv' if flood_filename else 'vulnerability_summary_by_region.csv'
+        csv_path = os.path.join(output_dir, csv_filename)
+        
+        plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+        print(f"Vulnerability map saved to {plot_path}")
+        
+        # Save a summary CSV for vulnerability (only plotted data)
+        vuln_gdf_plot[['region_name', 'nuts_id', 'total_population', 'vulnerable_pop_thresh', 'vulnerable_pct_thresh']].to_csv(
+            csv_path, index=False)
+        print(f"Vulnerability summary CSV saved to {csv_path}")
+    
+    # Calculate total vulnerable population from the original GDF (before filtering for plot)
+    # This gives the sum over ALL regions, even those not plotted (e.g. pop=0)
+    total_vulnerable_pop_all_regions_gdf = results_gdf['vulnerable_pop_thresh'].sum()
+    print(f"Total vulnerable population across all regions (from GDF): {total_vulnerable_pop_all_regions_gdf:,.0f}")
           
-    return vulnerable_pop, total_vulnerable_pop
+    return total_vulnerable_pop_all_regions_gdf # Return sum from all regions in GDF
+
 
 def setup_logging(output_dir):
     """
@@ -1697,18 +1444,21 @@ def setup_logging(output_dir):
     
     return log_file_path
 
-def process_region_with_income(region_data):
+# def process_region_with_income(region_data): # Old signature
+def process_region_with_income(task_data_tuple): # New signature
     """
-    Process a single region with income analysis in its own process
-    Returns the result data for that region with income stratification
+    Process a single region with income analysis and vulnerability assessment in its own process.
+    Returns the result data for that region with income stratification and vulnerability metrics.
+    Vulnerability is defined as: income < income_threshold_vuln_arg AND flood_depth > 0.
+    The flood_threshold_context_arg is available but ignored for the vulnerability flood condition.
     """
-    import os  # Make sure we have os available for pid
     
     # Declare global variables to be used in this worker function
-    global pop_data, flood_data, income_data_global, nuts_gdf, depth_ranges
+    global pop_data, flood_data, income_data_global, nuts_gdf, depth_ranges # depth_ranges is for income stratification
     
-    # At the start of the function - add process ID for tracking
-    idx, region = region_data
+    # Unpack task data
+    idx, region, flood_threshold_context_arg, income_threshold_vuln_arg = task_data_tuple
+    
     region_name = region.get('NAME_LATN', region.get('NUTS_NAME', 'Unknown'))
     worker_pid = os.getpid()
     print(f"WORKER START [PID {worker_pid}]: Processing region {region_name}")
@@ -1756,6 +1506,7 @@ def process_region_with_income(region_data):
             low_income_mask = income_region <= income_low_threshold
             mid_income_mask = (income_region > income_low_threshold) & (income_region <= income_high_threshold)
             high_income_mask = income_region > income_high_threshold
+
         else:
             output_buffer.append("  Warning: No valid income data for this region")
             print("\n".join(output_buffer))
@@ -1786,6 +1537,7 @@ def process_region_with_income(region_data):
                 depth_mask = flood_region > min_depth
                 range_name = f">{min_depth}m"
             else:
+:
                 depth_mask = (flood_region > min_depth) & (flood_region <= max_depth)
                 range_name = f"{min_depth}-{max_depth}m"
             
@@ -1828,7 +1580,7 @@ def process_region_with_income(region_data):
             'region_name': region_name,
             'nuts_id': region.get('NUTS_ID', 'Unknown'),
             'nuts_level': region.get('LEVL_CODE', 'Unknown'),
-            'total_population': total_pop,
+            'total_population': total_pop, # This is total_pop for the region
             'total_affected': total_affected,
             'percentage_affected': percentage_affected,
             'low_income_population': pop_low_income,
@@ -1842,6 +1594,28 @@ def process_region_with_income(region_data):
             **depth_mid_income,  # Middle income by depth
             **depth_high_income  # High income by depth
         }
+
+        # --- Add Vulnerability Analysis logic ---
+        # Vulnerability: Income < income_threshold_vuln_arg AND Flood Depth > 0m
+        output_buffer.append(f"  Calculating vulnerability (flood > 0m & income < {income_threshold_vuln_arg} PPP)")
+        
+        # Create masks for vulnerability
+        vuln_flood_mask = flood_region > 0  # Use any flooding as the criterion
+        vuln_income_mask = income_region < income_threshold_vuln_arg # income_region is already clipped
+        vuln_combined_mask = vuln_flood_mask & vuln_income_mask
+        
+        # Calculate vulnerable population based on these specific thresholds
+        # total_pop is already calculated for the region
+        vulnerable_pop_specific = float(pop_region.where(vuln_combined_mask, 0).sum().values)
+        vulnerable_pct_specific = (vulnerable_pop_specific / total_pop * 100) if total_pop > 0 else 0
+        
+        output_buffer.append(f"    Vulnerable population (flood > 0m, income < {income_threshold_vuln_arg:,.0f} PPP): {vulnerable_pop_specific:,.2f}")
+        output_buffer.append(f"    Vulnerable percentage: {vulnerable_pct_specific:.2f}%")
+
+        # Add vulnerability metrics to the result_row
+        result_row['vulnerable_pop_thresh'] = vulnerable_pop_specific
+        result_row['vulnerable_pct_thresh'] = vulnerable_pct_specific
+        # 'total_population' is already in result_row and is the correct denominator for vulnerable_pct_thresh
         
     except Exception as e:
         output_buffer.append(f"  Error processing region: {str(e)}")
@@ -1863,90 +1637,92 @@ def process_region_with_income(region_data):
     
     return result_row
 
-def process_vulnerable_region(region_data):
-    """Process a single region to identify vulnerable areas"""
-    global nuts_gdf, pop_data_global, flood_data_global, income_data_global
-    
-    idx, region, flood_threshold, income_threshold = region_data
-    region_name = region.get('NAME_LATN', region.get('NUTS_NAME', 'Unknown'))
-    nuts_id = region.get('NUTS_ID', 'Unknown')
-    
-    result = {
-        'region_name': region_name,
-        'nuts_id': nuts_id,
-        'vulnerable_population': 0,
-        'total_population': 0,
-        'vulnerable_percentage': 0
-    }
-    
-    try:
-        # Clip data to region
-        region_gdf = gpd.GeoDataFrame(geometry=[region.geometry], crs=nuts_gdf.crs)
-        pop_region = pop_data_global.rio.clip(region_gdf.geometry, region_gdf.crs)
-        flood_region = flood_data_global.rio.clip(region_gdf.geometry, region_gdf.crs)
-        income_region = income_data_global.rio.clip(region_gdf.geometry, region_gdf.crs)
-        
-        # Calculate total population in region
-        total_pop = float(pop_region.sum().values)
-        print(f"  Total population in region: {total_pop:,.2f}")
-        
-        # Calculate income thresholds for the region - WITH ENHANCED DEBUGGING
-        # We'll use the 33rd and 66th percentiles to divide into thirds
-        income_values = income_region.values[~np.isnan(income_region.values)]
-        print(f"  Income data shape: {income_region.shape}")
-        print(f"  Valid income values count: {len(income_values)}")
-        
-        if len(income_values) > 0:
-            # Print detailed income statistics
-            print(f"  Income statistics:")
-            print(f"    Min: {income_values.min():.2f}")
-            print(f"    Max: {income_values.max():.2f}")
-            print(f"    Mean: {income_values.mean():.2f}")
-            print(f"    Median: {np.median(income_values):.2f}")
-            print(f"    5th percentile: {np.percentile(income_values, 5):.2f}")
-            print(f"    95th percentile: {np.percentile(income_values, 95):.2f}")
-            
-            # Calculate thresholds with clear debug info
-            income_low_threshold = np.percentile(income_values, 33.33)
-            income_high_threshold = np.percentile(income_values, 66.67)
-            print(f"  Income thresholds:")
-            print(f"    Low: <{income_low_threshold:.2f}")
-            print(f"    Medium: {income_low_threshold:.2f}-{income_high_threshold:.2f}")
-            print(f"    High: >{income_high_threshold:.2f}")
-            
-            # Verify distribution after applying thresholds
-            low_count = np.sum(income_values <= income_low_threshold)
-            mid_count = np.sum((income_values > income_low_threshold) & (income_values <= income_high_threshold))
-            high_count = np.sum(income_values > income_high_threshold)
-            
-            print(f"  Income distribution verification:")
-            print(f"    Low income cells: {low_count} ({low_count/len(income_values)*100:.2f}%)")
-            print(f"    Mid income cells: {mid_count} ({mid_count/len(income_values)*100:.2f}%)")
-            print(f"    High income cells: {high_count} ({high_count/len(income_values)*100:.2f}%)")
+# Function to be removed: process_vulnerable_region
+# The functionality of process_vulnerable_region has been integrated into process_region_with_income.
+# This function definition below will be removed.
+# def process_vulnerable_region(region_data):
+#     """Process a single region to identify vulnerable areas"""
+#     global nuts_gdf, pop_data_global, flood_data_global, income_data_global
+#     
+#     idx, region, flood_threshold, income_threshold = region_data
+#     region_name = region.get('NAME_LATN', region.get('NUTS_NAME', 'Unknown'))
+#     nuts_id = region.get('NUTS_ID', 'Unknown')
+#     
+#     result = {
+#         'region_name': region_name,
+#         'nuts_id': nuts_id,
+#         'vulnerable_population': 0,
+#         'total_population': 0,
+#         'vulnerable_percentage': 0
+#     }
+#     
+#     try:
+#         # Clip data to region
+#         region_gdf = gpd.GeoDataFrame(geometry=[region.geometry], crs=nuts_gdf.crs)
+#         pop_region = pop_data_global.rio.clip(region_gdf.geometry, region_gdf.crs)
+#         flood_region = flood_data_global.rio.clip(region_gdf.geometry, region_gdf.crs)
+#         income_region = income_data_global.rio.clip(region_gdf.geometry, region_gdf.crs)
+#         
+#         # Calculate total population in region
+#         total_pop = float(pop_region.sum().values)
+#         print(f"  Total population in region: {total_pop:,.2f}")
+#         
+#         # Calculate income thresholds for the region - WITH ENHANCED DEBUGGING
+#         # We'll use the 33rd and 66th percentiles to divide into thirds
+#         income_values = income_region.values[~np.isnan(income_region.values)]
+#         print(f"  Income data shape: {income_region.shape}")
+#         print(f"  Valid income values count: {len(income_values)}")
+#         
+#         if len(income_values) > 0:
+#             # Print detailed income statistics
+#             print(f"  Income statistics:")
+#             print(f"    Min: {income_values.min():.2f}")
+#             print(f"    Max: {income_values.max():.2f}")
+#             print(f"    Mean: {income_values.mean():.2f}")
+#             print(f"    Median: {np.median(income_values):.2f}")
+#             print(f"    5th percentile: {np.percentile(income_values, 5):.2f}")
+#             print(f"    95th percentile: {np.percentile(income_values, 95):.2f}")
+#             
+#             # Calculate thresholds with clear debug info
+#             income_low_threshold = np.percentile(income_values, 33.33)
+#             income_high_threshold = np.percentile(income_values, 66.67)
+#             print(f"  Income thresholds:")
+#             print(f"    Low: <{income_low_threshold:.2f}")
+#             print(f"    Medium: {income_low_threshold:.2f}-{income_high_threshold:.2f}")
+#             print(f"    High: >{income_high_threshold:.2f}")
+#             
+#             # Verify distribution after applying thresholds
+#             low_count = np.sum(income_values <= income_low_threshold)
+#             mid_count = np.sum((income_values > income_low_threshold) & (income_values <= income_high_threshold))
+#             high_count = np.sum(income_values > income_high_threshold)
+#             
+#             print(f"  Income distribution verification:")
+#             print(f"    Low income cells: {low_count} ({low_count/len(income_values)*100:.2f}%)")
+#             print(f"    Mid income cells: {mid_count} ({mid_count/len(income_values)*100:.2f}%)")
+#             print(f"    High income cells: {high_count} ({high_count/len(income_values)*100:.2f}%)")
 
-        # Create masks
-        flood_mask = flood_region > flood_threshold
-        income_mask = income_region < income_threshold
-        combined_mask = flood_mask & income_mask
-        
-        # Calculate population
-        total_pop = float(pop_region.sum().values)
-        vulnerable_pop = float(pop_region.where(combined_mask, 0).sum().values)
-        vulnerable_pct = (vulnerable_pop / total_pop * 100) if total_pop > 0 else 0
-        
-        # Update result
-        result.update({
-            'vulnerable_population': vulnerable_pop,
-            'total_population': total_pop,
-            'vulnerable_percentage': vulnerable_pct
-        })
-        
-    except Exception as e:
-        print(f"Error processing region {region_name} for vulnerability: {str(e)}")
-    
-    return result
+#         # Create masks
+#         flood_mask = flood_region > flood_threshold
+#         income_mask = income_region < income_threshold
+#         combined_mask = flood_mask & income_mask
+#         
+#         # Calculate population
+#         total_pop = float(pop_region.sum().values)
+#         vulnerable_pop = float(pop_region.where(combined_mask, 0).sum().values)
+#         vulnerable_pct = (vulnerable_pop / total_pop * 100) if total_pop > 0 else 0
+#         
+#         # Update result
+#         result.update({
+#             'vulnerable_population': vulnerable_pop,
+#             'total_population': total_pop,
+#             'vulnerable_percentage': vulnerable_pct
+#         })
+#         
+#     except Exception as e:
+#         print(f"Error processing region {region_name} for vulnerability: {str(e)}")
+#     
+#     return result
 
-# Add missing chunk_data function
 def chunk_data(data, chunk_size):
     """Split data into chunks of specified size"""
     for i in range(0, len(data), chunk_size):
@@ -2042,28 +1818,81 @@ if __name__ == "__main__":
     # For multiprocessing on Windows/Linux
     multiprocessing.freeze_support()
     
-    # Parse command-line arguments
-    args = parse_arguments()
+    # Start with a print statement showing execution environment
+    print(f"Starting flood analysis on {platform.node()} with Python {sys.version}")
+    print(f"Environment variables: SLURM_JOB_ID={os.environ.get('SLURM_JOB_ID', 'Not set')}")
+    print(f"SLURM_CPUS_PER_TASK={os.environ.get('SLURM_CPUS_PER_TASK', 'Not set')}")
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
     
-    # Call main with arguments from command line
-    try:
-        # Start with a print statement showing execution environment
-        print(f"Starting flood analysis on {platform.node()} with Python {sys.version}")
-        print(f"Environment variables: SLURM_JOB_ID={os.environ.get('SLURM_JOB_ID', 'Not set')}")
-        print(f"SLURM_CPUS_PER_TASK={os.environ.get('SLURM_CPUS_PER_TASK', 'Not set')}")
-        
-        status = main(
-            region_bounds=args.bounds,
-            output_dir=args.output,
-            skip_vis=args.no_vis,
-            nuts_level=args.nuts_level,
-            cpu_cores=args.cores,
-            chunk_size=args.chunk_size,
-            flood_threshold=args.flood_threshold,
-            income_threshold=args.income_threshold
-        )
-        sys.exit(status or 0)
-    except Exception as e:
-        print(f"Error in execution: {str(e)}")
-        traceback.print_exc()
-        sys.exit(1)
+    # --- Define dataset locations and parameters ---
+    population_base_dir = '/hdrive/all_users/wiederkehr/analysis/population_files'
+    income_base_dir = '/hdrive/all_users/wiederkehr/analysis/income_files'
+    flood_file_dir = '/hdrive/all_users/wiederkehr/analysis/flood_files'
+
+    # Define the SSPs, years, and flood events to iterate over
+    ssps = ["SSP1", "SSP2"] # Add all your SSPs
+    years = ["2020", "2030", "2040", "2050", "2100"] # Add all relevant years
+    flood_rps = [30, 100, 500] # Return periods for flood events
+
+    base_output_directory = os.path.join(script_dir, "analysis_runs_output_all_combinations")
+    os.makedirs(base_output_directory, exist_ok=True)
+
+    # --- Iterate through all combinations ---
+    for ssp in ssps:
+        ssp_folder_name = ssp # e.g., "SSP1"
+        population_ssp_dir = os.path.join(population_base_dir, ssp_folder_name)
+
+        for year in years:
+            population_file_name = f"{ssp}_{year}.tif"
+            population_file_path = os.path.join(population_ssp_dir, population_file_name)
+
+            income_file_name = f"Europe_disp_inc_{year}_{ssp}.tif"
+            income_file_path = os.path.join(income_base_dir, income_file_name)
+
+            # Check if primary files exist before proceeding with flood events
+            if not os.path.exists(population_file_path):
+                print(f"SKIPPING: Population file not found: {population_file_path}")
+                continue
+            if not os.path.exists(income_file_path):
+                print(f"SKIPPING: Income file not found: {income_file_path}")
+                continue
+
+            for rp in flood_rps:
+                flood_file_name = f"Europe_RP{rp}_filled_depth.tif"
+                flood_file_path = os.path.join(flood_file_dir, flood_file_name)
+
+                if not os.path.exists(flood_file_path):
+                    print(f"SKIPPING: Flood file not found: {flood_file_path} for SSP {ssp}, Year {year}")
+                    continue
+                
+                print(f"\\n{'='*30} PROCESSING NEW COMBINATION {'='*30}")
+                print(f"SSP: {ssp}, Year: {year}, Flood RP: {rp}")
+                print(f"Population: {population_file_path}")
+                print(f"Income: {income_file_path}")
+                print(f"Flood: {flood_file_path}")
+                print(f"{'='*80}\\n")
+
+                try:
+                    status = main(
+                        population_file_path=population_file_path,
+                        income_file_path=income_file_path,
+                        flood_file_path=flood_file_path,
+                        base_output_dir=base_output_directory,
+                        nuts_level=3, # Or your desired default
+                        cpu_cores=32, # Or your desired default
+                        flood_threshold=0,
+                        income_threshold=18000 # Or your desired default
+                        # region_bounds can be set here if needed, e.g. region_bounds=(-10.0, 36.0, 30.0, 72.0)
+                    )
+                    if status is not None and status != 0:
+                         print(f"WARNING: Main function returned status {status} for {ssp}_{year}_RP{rp}")
+                except Exception as e:
+                    print(f"CRITICAL ERROR processing {ssp}_{year}_RP{rp}: {str(e)}")
+                    traceback.print_exc()
+                    print("Continuing with the next combination...")
+                
+                print(f"\\n{'='*30} COMPLETED COMBINATION: SSP {ssp}, Year {year}, Flood RP {rp} {'='*30}\\n")
+
+    print("\\nAll combinations processed.")
+    sys.exit(0)
