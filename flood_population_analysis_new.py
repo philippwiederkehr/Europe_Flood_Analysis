@@ -500,6 +500,7 @@ def calculate_country_median_incomes(income_data_aligned, pop_data_aligned, all_
             continue
         
         print(f"  Processing country for weighted median income: {country_code}")
+        print_memory_usage(f"Before processing country {country_code}")
         country_specific_nuts = all_nuts_regions_gdf[all_nuts_regions_gdf['CNTR_CODE'] == country_code]
         
         if country_specific_nuts.empty:
@@ -520,9 +521,14 @@ def calculate_country_median_incomes(income_data_aligned, pop_data_aligned, all_
                 print(f"    Reprojecting geometry for {country_code} from {country_geometry_for_clip.crs} to {income_data_aligned.rio.crs} for clipping.")
                 country_geometry_for_clip = country_geometry_for_clip.to_crs(income_data_aligned.rio.crs)
 
-            # Clip income and population data to the country's geometry
-            income_country_clipped = income_data_aligned.rio.clip(country_geometry_for_clip, all_touched=True)
-            pop_country_clipped = pop_data_aligned.rio.clip(country_geometry_for_clip, all_touched=True)
+             # Clip income and population data to the country's geometry
+            try:
+                income_country_clipped = income_data_aligned.rio.clip(country_geometry_for_clip, all_touched=True)
+                pop_country_clipped = pop_data_aligned.rio.clip(country_geometry_for_clip, all_touched=True)
+            except rioxarray.exceptions.NoDataInBounds:
+                print(f"    No data found in bounds when clipping for country {country_code}. Median will be NaN.")
+                country_medians[country_code] = np.nan
+                continue # Skip to the next country
             
             country_income_values = income_country_clipped.values.flatten()
             country_pop_values = pop_country_clipped.values.flatten()
@@ -568,6 +574,9 @@ def calculate_country_median_incomes(income_data_aligned, pop_data_aligned, all_
             import traceback
             traceback.print_exc()
             country_medians[country_code] = np.nan
+        print_memory_usage(f"After processing country {country_code}")
+        import gc
+        gc.collect() 
 
     print(f"Calculated weighted median incomes for {len(country_medians)} countries.")
     print_memory_usage("After calculating country weighted median incomes")
@@ -677,7 +686,7 @@ def main(population_file_path: str, income_file_path: str, flood_file_path: str,
     
     # Use the region bounds from arguments or default to Europe
     if region_bounds is None:
-        region_bounds = (16.18, 48.10, 16.58, 48.32)  # Default covers most of mainland Europe
+        region_bounds = (-10, 36, 30, 72)  # Default covers most of mainland Europe
         region_name = "Mainland Europe"
     else:
         region_name = "Custom Region"
